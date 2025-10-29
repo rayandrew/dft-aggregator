@@ -43,8 +43,8 @@ int main(int argc, char** argv) {
         .help(
             "Time interval in microseconds for bucketing (default: 1000000 = "
             "1 second)")
-        .scan<'d', uint64_t>()
-        .default_value(static_cast<uint64_t>(1000000));
+        .scan<'d', std::uint64_t>()
+        .default_value(static_cast<std::uint64_t>(1000000));
 
     program.add_argument("-g", "--group-keys")
         .help(
@@ -102,6 +102,18 @@ int main(int argc, char** argv) {
         .scan<'d', int>()
         .default_value(6);
 
+    program.add_argument("--boundary-events")
+        .help(
+            "Boundary event configuration: event_name:value_field:output_name "
+            "(e.g., \"epoch.block:iter_count:epoch\")")
+        .default_value<std::string>("");
+
+    program.add_argument("--no-track-process-parents")
+        .help(
+            "Disable tracking of process parent relationships from fork/spawn")
+        .default_value(false)
+        .implicit_value(true);
+
     try {
         program.parse_args(argc, argv);
     } catch (const std::exception& err) {
@@ -113,7 +125,8 @@ int main(int argc, char** argv) {
     // Parse arguments
     std::string log_dir = program.get<std::string>("--directory");
     std::string output_file = program.get<std::string>("--output");
-    uint64_t time_interval_us = program.get<uint64_t>("--time-interval");
+    std::uint64_t time_interval_us =
+        program.get<std::uint64_t>("--time-interval");
     std::string group_keys_str = program.get<std::string>("--group-keys");
     std::string metric_fields_str = program.get<std::string>("--metric-fields");
     std::string categories_str = program.get<std::string>("--categories");
@@ -127,6 +140,9 @@ int main(int argc, char** argv) {
     std::string index_dir = program.get<std::string>("--index-dir");
     bool compress_output = program.get<bool>("--compress");
     int compression_level = program.get<int>("--compression-level");
+    std::string boundary_events_str =
+        program.get<std::string>("--boundary-events");
+    bool no_track_parents = program.get<bool>("--no-track-process-parents");
 
     // Automatically add .gz extension if compressing and not already present
     if (compress_output) {
@@ -200,7 +216,7 @@ int main(int argc, char** argv) {
 
     if (!group_keys.empty()) {
         std::printf("  Extra group keys: ");
-        for (size_t i = 0; i < group_keys.size(); ++i) {
+        for (std::size_t i = 0; i < group_keys.size(); ++i) {
             std::printf("%s%s", group_keys[i].c_str(),
                         i < group_keys.size() - 1 ? ", " : "\n");
         }
@@ -208,7 +224,7 @@ int main(int argc, char** argv) {
 
     if (!metric_fields.empty()) {
         std::printf("  Custom metric fields: ");
-        for (size_t i = 0; i < metric_fields.size(); ++i) {
+        for (std::size_t i = 0; i < metric_fields.size(); ++i) {
             std::printf("%s%s", metric_fields[i].c_str(),
                         i < metric_fields.size() - 1 ? ", " : "\n");
         }
@@ -217,6 +233,28 @@ int main(int argc, char** argv) {
     std::printf("==========================================\n\n");
 
     // Setup aggregation configuration
+    // Parse boundary events configuration
+    std::vector<BoundaryEventConfig> boundary_events;
+    if (!boundary_events_str.empty()) {
+        std::stringstream ss(boundary_events_str);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            // Parse format: event_name:value_field:output_name
+            std::stringstream item_ss(item);
+            std::string event_name, value_field, output_name;
+
+            if (std::getline(item_ss, event_name, ':') &&
+                std::getline(item_ss, value_field, ':') &&
+                std::getline(item_ss, output_name, ':')) {
+                BoundaryEventConfig config;
+                config.event_name = event_name;
+                config.value_field = value_field;
+                config.output_name = output_name;
+                boundary_events.push_back(config);
+            }
+        }
+    }
+
     AggregationConfig agg_config;
     agg_config.time_interval_us = time_interval_us;
     agg_config.extra_group_keys = group_keys;
@@ -225,6 +263,8 @@ int main(int argc, char** argv) {
     agg_config.include_names = include_names;
     agg_config.compute_statistics = true;
     agg_config.include_trace_metadata = true;
+    agg_config.boundary_events = boundary_events;
+    agg_config.track_process_parents = !no_track_parents;
 
     // Create pipeline with configuration
     auto pipeline_config = PipelineConfigManager()

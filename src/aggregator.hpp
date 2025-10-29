@@ -19,8 +19,8 @@
 struct TraceMetadata {
     std::string trace_file_path;
     int rank;
-    uint64_t min_timestamp = std::numeric_limits<uint64_t>::max();
-    uint64_t max_timestamp = 0;
+    std::uint64_t min_timestamp = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_timestamp = 0;
 };
 
 class ThreadLocalAggregator {
@@ -31,7 +31,7 @@ class ThreadLocalAggregator {
             local_map;
         std::thread::id thread_id;
         int thread_index;
-        uint64_t events_processed = 0;
+        std::uint64_t events_processed = 0;
     };
 
     static thread_local ThreadLocalData* tls_data;
@@ -57,7 +57,7 @@ class ThreadLocalAggregator {
         return tls_data;
     }
 
-    uint64_t compute_time_bucket(uint64_t timestamp) const {
+    std::uint64_t compute_time_bucket(std::uint64_t timestamp) const {
         if (config_.use_relative_time) {
             timestamp -= config_.reference_timestamp;
         }
@@ -65,7 +65,7 @@ class ThreadLocalAggregator {
                config_.time_interval_us;
     }
 
-    AggregationKey build_key(yyjson_val* event, uint64_t reference_ts) {
+    AggregationKey build_key(yyjson_val* event, std::uint64_t reference_ts) {
         AggregationKey key;
 
         key.cat = TraceParser::get_string(event, "cat");
@@ -78,7 +78,7 @@ class ThreadLocalAggregator {
         key.fhash = TraceParser::get_arg_string(event, "fhash");
 
         // Time bucket
-        uint64_t timestamp = TraceParser::get_uint64(event, "ts");
+        std::uint64_t timestamp = TraceParser::get_uint64(event, "ts");
         key.time_bucket = compute_time_bucket(timestamp);
 
         // Extra keys from args
@@ -115,28 +115,23 @@ class ThreadLocalAggregator {
 
         // Build aggregation key
         AggregationKey key = build_key(event, 0);
-
-        // Get or create metrics entry (lock-free!)
         auto& metrics = thread_data->local_map[key];
 
-        // Extract event data
-        uint64_t duration = TraceParser::get_uint64(event, "dur");
-        uint64_t timestamp = TraceParser::get_uint64(event, "ts");
-
-        // Update metrics
+        std::uint64_t duration = TraceParser::get_uint64(event, "dur");
+        std::uint64_t timestamp = TraceParser::get_uint64(event, "ts");
         metrics.update_duration(duration);
         metrics.update_timestamp(timestamp);
 
         // Handle size (from args.ret)
         if (TraceParser::has_arg(event, "ret")) {
-            uint64_t size = TraceParser::get_arg_uint64(event, "ret");
+            std::uint64_t size = TraceParser::get_arg_uint64(event, "ret");
             metrics.update_size(size);
         }
 
         // Handle custom metrics
         for (const auto& field : config_.custom_metric_fields) {
             if (TraceParser::has_arg(event, field.c_str())) {
-                uint64_t value =
+                std::uint64_t value =
                     TraceParser::get_arg_uint64(event, field.c_str());
                 metrics.update_custom_metric(field, value);
             }
@@ -178,7 +173,7 @@ class ThreadLocalAggregator {
 
         // If root is array, iterate through events
         if (yyjson_is_arr(root)) {
-            size_t idx, max;
+            std::size_t idx, max;
             yyjson_val* event;
             yyjson_arr_foreach(root, idx, max, event) {
                 if (yyjson_is_obj(event)) {
@@ -214,7 +209,7 @@ class ThreadLocalAggregator {
             });
 
             // Limit number of concurrent threads
-            if (threads.size() >= static_cast<size_t>(num_threads)) {
+            if (threads.size() >= static_cast<std::size_t>(num_threads)) {
                 for (auto& t : threads) {
                     if (t.joinable()) {
                         t.join();
@@ -251,10 +246,10 @@ class ThreadLocalAggregator {
         return merged;
     }
 
-    size_t get_num_threads() const { return all_thread_data_.size(); }
+    std::size_t get_num_threads() const { return all_thread_data_.size(); }
 
-    uint64_t get_total_events_processed() const {
-        uint64_t total = 0;
+    std::uint64_t get_total_events_processed() const {
+        std::uint64_t total = 0;
         for (const auto& thread_data : all_thread_data_) {
             total += thread_data->events_processed;
         }

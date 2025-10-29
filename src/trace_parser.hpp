@@ -19,13 +19,13 @@ class TraceParser {
     }
 
     // Helper: safely get uint64 from yyjson value
-    static uint64_t get_uint64(yyjson_val* val, const char* key,
-                               uint64_t default_val = 0) {
+    static std::uint64_t get_uint64(yyjson_val* val, const char* key,
+                                    std::uint64_t default_val = 0) {
         yyjson_val* v = yyjson_obj_get(val, key);
         if (v && yyjson_is_uint(v)) {
             return yyjson_get_uint(v);
         } else if (v && yyjson_is_int(v)) {
-            return static_cast<uint64_t>(yyjson_get_int(v));
+            return static_cast<std::uint64_t>(yyjson_get_int(v));
         }
         return default_val;
     }
@@ -44,8 +44,8 @@ class TraceParser {
     }
 
     // Helper: safely get uint64 from args
-    static uint64_t get_arg_uint64(yyjson_val* event, const char* key,
-                                   uint64_t default_val = 0) {
+    static std::uint64_t get_arg_uint64(yyjson_val* event, const char* key,
+                                        std::uint64_t default_val = 0) {
         yyjson_val* args = yyjson_obj_get(event, "args");
         if (!args || !yyjson_is_obj(args)) return default_val;
 
@@ -53,7 +53,7 @@ class TraceParser {
         if (v && yyjson_is_uint(v)) {
             return yyjson_get_uint(v);
         } else if (v && yyjson_is_int(v)) {
-            return static_cast<uint64_t>(yyjson_get_int(v));
+            return static_cast<std::uint64_t>(yyjson_get_int(v));
         }
         return default_val;
     }

@@ -10,39 +10,44 @@
 
 struct AggregationMetrics {
     // Event count
-    uint64_t count = 0;
+    std::uint64_t count = 0;
 
     // Duration statistics (microseconds)
-    uint64_t total_duration = 0;
-    uint64_t min_duration = std::numeric_limits<uint64_t>::max();
-    uint64_t max_duration = 0;
+    std::uint64_t total_duration = 0;
+    std::uint64_t min_duration = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_duration = 0;
     double mean_duration = 0.0;
     double m2_duration = 0.0;  // For Welford's algorithm
 
     // Size statistics (bytes)
-    uint64_t total_size = 0;
-    uint64_t min_size = std::numeric_limits<uint64_t>::max();
-    uint64_t max_size = 0;
+    std::uint64_t total_size = 0;
+    std::uint64_t min_size = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_size = 0;
     double mean_size = 0.0;
     double m2_size = 0.0;
 
     // Timestamp range
-    uint64_t first_ts = std::numeric_limits<uint64_t>::max();
-    uint64_t last_ts = 0;
+    std::uint64_t first_ts = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t last_ts = 0;
 
     // Contributing sources
     std::set<int> contributing_ranks;
     std::set<std::string> contributing_traces;
 
+    // Association data
+    std::unordered_map<std::string, std::string>
+        boundary_associations;     // e.g., {"epoch": "1", "step": "5"}
+    std::uint64_t parent_pid = 0;  // Parent process ID (0 if none)
+
     // Custom metrics (using unordered_map for O(1) access)
-    std::unordered_map<std::string, uint64_t> custom_sum;
-    std::unordered_map<std::string, uint64_t> custom_min;
-    std::unordered_map<std::string, uint64_t> custom_max;
+    std::unordered_map<std::string, std::uint64_t> custom_sum;
+    std::unordered_map<std::string, std::uint64_t> custom_min;
+    std::unordered_map<std::string, std::uint64_t> custom_max;
     std::unordered_map<std::string, double> custom_mean;
     std::unordered_map<std::string, double> custom_m2;
 
     // Update methods
-    void update_duration(uint64_t dur) {
+    void update_duration(std::uint64_t dur) {
         count++;
         total_duration += dur;
 
@@ -56,7 +61,7 @@ struct AggregationMetrics {
         m2_duration += delta * delta2;
     }
 
-    void update_size(uint64_t size) {
+    void update_size(std::uint64_t size) {
         total_size += size;
 
         if (size < min_size) min_size = size;
@@ -68,7 +73,7 @@ struct AggregationMetrics {
         m2_size += delta * delta2;
     }
 
-    void update_timestamp(uint64_t ts) {
+    void update_timestamp(std::uint64_t ts) {
         if (ts < first_ts) first_ts = ts;
         if (ts > last_ts) last_ts = ts;
     }
@@ -78,11 +83,11 @@ struct AggregationMetrics {
         contributing_traces.insert(trace_file);
     }
 
-    void update_custom_metric(const std::string& name, uint64_t value) {
+    void update_custom_metric(const std::string& name, std::uint64_t value) {
         custom_sum[name] += value;
 
         if (custom_min.find(name) == custom_min.end()) {
-            custom_min[name] = std::numeric_limits<uint64_t>::max();
+            custom_min[name] = std::numeric_limits<std::uint64_t>::max();
         }
         if (value < custom_min[name]) custom_min[name] = value;
         if (value > custom_max[name]) custom_max[name] = value;
@@ -113,9 +118,9 @@ struct AggregationMetrics {
 
     // Merge from another metrics object (for combining thread-local results)
     void merge_from(const AggregationMetrics& other) {
-        uint64_t n1 = count;
-        uint64_t n2 = other.count;
-        uint64_t n = n1 + n2;
+        std::uint64_t n1 = count;
+        std::uint64_t n2 = other.count;
+        std::uint64_t n = n1 + n2;
 
         // Merge counts and sums
         count = n;
@@ -156,7 +161,7 @@ struct AggregationMetrics {
             custom_sum[name] += value;
 
             if (custom_min.find(name) == custom_min.end()) {
-                custom_min[name] = std::numeric_limits<uint64_t>::max();
+                custom_min[name] = std::numeric_limits<std::uint64_t>::max();
             }
             custom_min[name] =
                 std::min(custom_min[name], other.custom_min.at(name));

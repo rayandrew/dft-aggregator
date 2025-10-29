@@ -74,120 +74,154 @@ class PerfettoCounterWriter {
         std::string buffer;
         buffer.reserve(1024 * 1024);  // Reserve 1MB initially
 
-        // Sort by time bucket
-        std::vector<std::pair<AggregationKey, AggregationMetrics>> sorted_aggs;
-        sorted_aggs.reserve(aggregations.size());
-        for (const auto& [key, metrics] : aggregations) {
-            sorted_aggs.emplace_back(key, metrics);
-        }
-        std::sort(sorted_aggs.begin(), sorted_aggs.end(),
-                  [](const auto& a, const auto& b) {
-                      if (a.first.time_bucket != b.first.time_bucket)
-                          return a.first.time_bucket < b.first.time_bucket;
-                      return a.first < b.first;
-                  });
-
         buffer += "[\n";
 
-        // Emit counter events for each aggregation bucket
-        for (const auto& [key, metrics] : sorted_aggs) {
-            auto write_counter = [&](const std::string& metric_suffix,
-                                     double value) {
-                // Use original name with metric suffix
-                std::string full_name = key.name + "[" + metric_suffix + "]";
+        // Emit one counter event per aggregation bucket with all metrics in
+        // args Note: No sorting needed - events are already grouped by
+        // time_bucket
+        for (const auto& [key, metrics] : aggregations) {
+            buffer += "{\"name\":\"";
+            append_json_string(buffer, key.name);
+            buffer += "\",\"cat\":\"";
+            append_json_string(buffer, key.cat);
 
-                buffer += "{\"name\":\"";
-                append_json_string(buffer, full_name);
-                buffer += "\",\"cat\":\"";
-                append_json_string(buffer, key.cat);
+            char temp[512];
+            std::snprintf(temp, sizeof(temp),
+                          "\",\"ts\":%llu,\"ph\":\"C\",\"pid\":%llu,"
+                          "\"tid\":%llu,\"args\":{\"hhash\":\"",
+                          key.time_bucket, key.pid, key.tid);
+            buffer += temp;
+            append_json_string(buffer, key.hhash);
+            buffer += "\"";
 
-                char temp[256];
-                std::snprintf(temp, sizeof(temp),
-                              "\",\"ts\":%llu,\"ph\":\"C\",\"pid\":%llu,"
-                              "\"tid\":%llu,\"args\":{\"hhash\":\"",
-                              key.time_bucket, key.pid, key.tid);
-                buffer += temp;
-                append_json_string(buffer, key.hhash);
+            if (!key.fhash.empty()) {
+                buffer += ",\"fhash\":\"";
+                append_json_string(buffer, key.fhash);
                 buffer += "\"";
+            }
 
-                if (!key.fhash.empty()) {
-                    buffer += ",\"fhash\":\"";
-                    append_json_string(buffer, key.fhash);
-                    buffer += "\"";
-                }
+            for (const auto& [k, v] : key.extra_keys) {
+                buffer += ",\"";
+                append_json_string(buffer, k);
+                buffer += "\":\"";
+                append_json_string(buffer, v);
+                buffer += "\"";
+            }
 
-                for (const auto& [k, v] : key.extra_keys) {
-                    buffer += ",\"";
-                    append_json_string(buffer, k);
-                    buffer += "\":\"";
-                    append_json_string(buffer, v);
-                    buffer += "\"";
-                }
+            // Add all metrics to args
+            std::snprintf(temp, sizeof(temp), ",\"count\":%llu", metrics.count);
+            buffer += temp;
 
-                std::snprintf(temp, sizeof(temp), ",\"value\":%.17g}}\n",
-                              value);
+            // Duration metrics as nested object
+            buffer += ",\"dur\":{";
+            std::snprintf(temp, sizeof(temp), "\"total\":%llu",
+                          metrics.total_duration);
+            buffer += temp;
+            std::snprintf(temp, sizeof(temp), ",\"mean\":%.17g",
+                          metrics.mean_duration);
+            buffer += temp;
+
+            if (metrics.min_duration !=
+                std::numeric_limits<std::uint64_t>::max()) {
+                std::snprintf(temp, sizeof(temp), ",\"min\":%llu",
+                              metrics.min_duration);
                 buffer += temp;
-            };
-
-            write_counter("count", static_cast<double>(metrics.count));
-            write_counter("dur.total",
-                          static_cast<double>(metrics.total_duration));
-            write_counter("dur.mean", metrics.mean_duration);
-
-            if (metrics.min_duration != std::numeric_limits<uint64_t>::max()) {
-                write_counter("dur.min",
-                              static_cast<double>(metrics.min_duration));
             }
             if (metrics.max_duration > 0) {
-                write_counter("dur.max",
-                              static_cast<double>(metrics.max_duration));
+                std::snprintf(temp, sizeof(temp), ",\"max\":%llu",
+                              metrics.max_duration);
+                buffer += temp;
             }
             if (compute_statistics && metrics.count >= 2) {
-                write_counter("dur.stddev", metrics.get_stddev_duration());
+                std::snprintf(temp, sizeof(temp), ",\"stddev\":%.17g",
+                              metrics.get_stddev_duration());
+                buffer += temp;
             }
+            buffer += "}";
 
+            // Size metrics as nested object (if present)
             if (metrics.total_size > 0) {
-                write_counter("size.total",
-                              static_cast<double>(metrics.total_size));
-                write_counter("size.mean", metrics.mean_size);
-                if (metrics.min_size != std::numeric_limits<uint64_t>::max()) {
-                    write_counter("size.min",
-                                  static_cast<double>(metrics.min_size));
+                buffer += ",\"size\":{";
+                std::snprintf(temp, sizeof(temp), "\"total\":%llu",
+                              metrics.total_size);
+                buffer += temp;
+                std::snprintf(temp, sizeof(temp), ",\"mean\":%.17g",
+                              metrics.mean_size);
+                buffer += temp;
+                if (metrics.min_size !=
+                    std::numeric_limits<std::uint64_t>::max()) {
+                    std::snprintf(temp, sizeof(temp), ",\"min\":%llu",
+                                  metrics.min_size);
+                    buffer += temp;
                 }
                 if (metrics.max_size > 0) {
-                    write_counter("size.max",
-                                  static_cast<double>(metrics.max_size));
+                    std::snprintf(temp, sizeof(temp), ",\"max\":%llu",
+                                  metrics.max_size);
+                    buffer += temp;
                 }
                 if (compute_statistics && metrics.count >= 2) {
-                    write_counter("size.stddev", metrics.get_stddev_size());
+                    std::snprintf(temp, sizeof(temp), ",\"stddev\":%.17g",
+                                  metrics.get_stddev_size());
+                    buffer += temp;
                 }
+                buffer += "}";
             }
 
+            // Custom metrics as nested objects
             for (const auto& [metric_name, sum_value] : metrics.custom_sum) {
-                write_counter(metric_name + ".total",
-                              static_cast<double>(sum_value));
-                write_counter(metric_name + ".mean",
+                buffer += ",\"";
+                append_json_string(buffer, metric_name);
+                buffer += "\":{";
+
+                std::snprintf(temp, sizeof(temp), "\"total\":%llu", sum_value);
+                buffer += temp;
+
+                std::snprintf(temp, sizeof(temp), ",\"mean\":%.17g",
                               metrics.custom_mean.at(metric_name));
+                buffer += temp;
+
                 if (metrics.custom_min.find(metric_name) !=
                         metrics.custom_min.end() &&
                     metrics.custom_min.at(metric_name) !=
-                        std::numeric_limits<uint64_t>::max()) {
-                    write_counter(metric_name + ".min",
-                                  static_cast<double>(
-                                      metrics.custom_min.at(metric_name)));
+                        std::numeric_limits<std::uint64_t>::max()) {
+                    std::snprintf(temp, sizeof(temp), ",\"min\":%llu",
+                                  metrics.custom_min.at(metric_name));
+                    buffer += temp;
                 }
                 if (metrics.custom_max.find(metric_name) !=
                         metrics.custom_max.end() &&
                     metrics.custom_max.at(metric_name) > 0) {
-                    write_counter(metric_name + ".max",
-                                  static_cast<double>(
-                                      metrics.custom_max.at(metric_name)));
+                    std::snprintf(temp, sizeof(temp), ",\"max\":%llu",
+                                  metrics.custom_max.at(metric_name));
+                    buffer += temp;
                 }
                 if (compute_statistics && metrics.count >= 2) {
-                    write_counter(metric_name + ".stddev",
+                    std::snprintf(temp, sizeof(temp), ",\"stddev\":%.17g",
                                   metrics.get_custom_stddev(metric_name));
+                    buffer += temp;
                 }
+
+                buffer += "}";
             }
+
+            // Add boundary associations (epoch, step, etc.)
+            for (const auto& [assoc_name, assoc_value] :
+                 metrics.boundary_associations) {
+                buffer += ",\"";
+                append_json_string(buffer, assoc_name);
+                buffer += "\":\"";
+                append_json_string(buffer, assoc_value);
+                buffer += "\"";
+            }
+
+            // Add parent process if available
+            if (metrics.parent_pid > 0) {
+                std::snprintf(temp, sizeof(temp), ",\"parent_pid\":%llu",
+                              metrics.parent_pid);
+                buffer += temp;
+            }
+
+            buffer += "}}\n";
         }
 
         buffer += "]\n";
@@ -249,14 +283,14 @@ class PerfettoCounterWriter {
         std::printf("Total unique aggregation keys: %zu\n",
                     aggregations.size());
 
-        uint64_t total_events = 0;
+        std::uint64_t total_events = 0;
         for (const auto& [key, metrics] : aggregations) {
             total_events += metrics.count;
         }
         std::printf("Total events aggregated: %llu\n", total_events);
 
         // Category breakdown
-        std::unordered_map<std::string, uint64_t> category_counts;
+        std::unordered_map<std::string, std::uint64_t> category_counts;
         for (const auto& [key, metrics] : aggregations) {
             category_counts[key.cat] += metrics.count;
         }

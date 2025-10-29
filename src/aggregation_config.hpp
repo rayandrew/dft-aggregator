@@ -4,11 +4,19 @@
 #include <string>
 #include <vector>
 
+// Configuration for boundary events (e.g., epoch markers)
+struct BoundaryEventConfig {
+    std::string event_name;  // Event name to look for (e.g., "epoch.block")
+    std::string
+        value_field;  // Arg field containing the value (e.g., "iter_count")
+    std::string output_name;  // Name in output (e.g., "epoch")
+};
+
 struct AggregationConfig {
     // Time bucketing
-    uint64_t time_interval_us = 1000000;  // Default: 1 second
+    std::uint64_t time_interval_us = 1000000;  // Default: 1 second
     bool use_relative_time = false;
-    uint64_t reference_timestamp = 0;
+    std::uint64_t reference_timestamp = 0;
 
     // Grouping keys from args
     std::vector<std::string>
@@ -27,6 +35,11 @@ struct AggregationConfig {
     // Options
     bool compute_statistics = true;
     bool include_trace_metadata = true;
+
+    // Association tracking
+    std::vector<BoundaryEventConfig>
+        boundary_events;                // Epoch/step boundary events
+    bool track_process_parents = true;  // Track fork/spawn parent relationships
 
     // Output
     std::string output_format = "json";  // "json", "csv", "parquet"

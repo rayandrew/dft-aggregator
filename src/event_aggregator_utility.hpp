@@ -14,6 +14,8 @@
 #include "aggregation_config.hpp"
 #include "aggregation_key.hpp"
 #include "aggregation_metrics.hpp"
+#include "association_tracker.hpp"
+#include "trace_parser.hpp"
 
 using namespace dftracer::utils;
 
@@ -70,10 +72,10 @@ class EventAggregatorUtility
    private:
     // Helper: Extract rank from filename
     int extract_rank_from_filename(const std::string& filename) const {
-        size_t rank_pos = filename.find("rank_");
+        std::size_t rank_pos = filename.find("rank_");
         if (rank_pos != std::string::npos) {
-            size_t num_start = rank_pos + 5;
-            size_t num_end =
+            std::size_t num_start = rank_pos + 5;
+            std::size_t num_end =
                 filename.find_first_not_of("0123456789", num_start);
             if (num_end != std::string::npos) {
                 std::string rank_str =
@@ -85,8 +87,8 @@ class EventAggregatorUtility
     }
 
     // Helper: Compute time bucket
-    uint64_t compute_time_bucket(uint64_t timestamp,
-                                 const AggregationConfig& config) const {
+    std::uint64_t compute_time_bucket(std::uint64_t timestamp,
+                                      const AggregationConfig& config) const {
         if (config.use_relative_time) {
             timestamp -= config.reference_timestamp;
         }
@@ -94,8 +96,9 @@ class EventAggregatorUtility
     }
 
     // Helper: Build aggregation key from yyjson event
-    AggregationKey build_key(yyjson_val* event,
-                             const AggregationConfig& config) const {
+    AggregationKey build_key(
+        yyjson_val* event, const AggregationConfig& config,
+        const AssociationTracker* association_tracker = nullptr) const {
         AggregationKey key;
 
         // Extract core fields
@@ -132,9 +135,20 @@ class EventAggregatorUtility
 
         // Time bucket
         val = yyjson_obj_get(event, "ts");
+        std::uint64_t timestamp = 0;
         if (val && yyjson_is_uint(val)) {
-            uint64_t timestamp = yyjson_get_uint(val);
+            timestamp = yyjson_get_uint(val);
             key.time_bucket = compute_time_bucket(timestamp, config);
+        }
+
+        // Add boundary associations (epoch, step, etc.) to the key for proper
+        // grouping
+        if (association_tracker && !config.boundary_events.empty()) {
+            auto associations = association_tracker->get_boundary_associations(
+                key.pid, timestamp);
+            for (const auto& [assoc_name, assoc_value] : associations) {
+                key.extra_keys[assoc_name] = assoc_value;
+            }
         }
 
         return key;
@@ -144,6 +158,7 @@ class EventAggregatorUtility
     void process_event(
         yyjson_val* event, int rank, const std::string& trace_file,
         const AggregationConfig& config,
+        const AssociationTracker& association_tracker,
         std::unordered_map<AggregationKey, AggregationMetrics,
                            AggregationKeyHash>& local_aggregations) const {
         // Extract basic fields for filtering
@@ -161,14 +176,14 @@ class EventAggregatorUtility
             return;
         }
 
-        // Build aggregation key
-        AggregationKey key = build_key(event, config);
+        // Build aggregation key (include associations for proper grouping)
+        AggregationKey key = build_key(event, config, &association_tracker);
 
         // Get or create metrics entry
         auto& metrics = local_aggregations[key];
 
         // Extract event data
-        uint64_t duration = 0, timestamp = 0, size = 0;
+        std::uint64_t duration = 0, timestamp = 0, size = 0;
 
         val = yyjson_obj_get(event, "dur");
         if (val && yyjson_is_uint(val)) duration = yyjson_get_uint(val);
@@ -193,7 +208,7 @@ class EventAggregatorUtility
             for (const auto& field : config.custom_metric_fields) {
                 val = yyjson_obj_get(args, field.c_str());
                 if (val && yyjson_is_uint(val)) {
-                    uint64_t value = yyjson_get_uint(val);
+                    std::uint64_t value = yyjson_get_uint(val);
                     metrics.update_custom_metric(field, value);
                 }
             }
@@ -202,6 +217,24 @@ class EventAggregatorUtility
         // Track contributing sources
         if (config.include_trace_metadata) {
             metrics.add_contributing_source(rank, trace_file);
+        }
+
+        // Add association data if first time seeing this key
+        if (metrics.count == 1) {
+            // Extract pid and timestamp for association lookup
+            std::uint64_t pid = TraceParser::get_uint64(event, "pid");
+            std::uint64_t ts = TraceParser::get_uint64(event, "ts");
+
+            // Get boundary associations (epoch, step, etc.)
+            if (!config.boundary_events.empty()) {
+                metrics.boundary_associations =
+                    association_tracker.get_boundary_associations(pid, ts);
+            }
+
+            // Get parent process
+            if (config.track_process_parents) {
+                metrics.parent_pid = association_tracker.get_parent_pid(pid);
+            }
         }
     }
 
@@ -215,7 +248,66 @@ class EventAggregatorUtility
                            AggregationKeyHash>
             local_aggregations;
 
-        // Process each metadata file
+        // Association tracker for boundary events and process relationships
+        AssociationTracker association_tracker;
+
+        // PASS 1: Extract associations if configured
+        if (input.config.track_process_parents ||
+            !input.config.boundary_events.empty()) {
+            DFTRACER_UTILS_LOG_INFO(
+                "Pass 1: Extracting associations (boundary events and process "
+                "relationships)...");
+
+            for (const auto& meta : input.metadata) {
+                if (!meta.success) continue;
+
+                // Read entire file for association extraction
+                auto reader_input =
+                    utilities::composites::IndexedReadInput::from_file(
+                        meta.file_path)
+                        .with_checkpoint_size(input.checkpoint_size)
+                        .with_index(meta.idx_path);
+
+                utilities::composites::IndexedFileReaderUtility reader_utility;
+                auto reader = reader_utility.process(reader_input);
+                if (!reader) continue;
+
+                auto stream =
+                    reader->stream(StreamType::LINE, RangeType::LINE_RANGE, 1,
+                                   reader->get_num_lines());
+                if (!stream) continue;
+
+                // Process each line (event) for association extraction
+                constexpr std::size_t BUFFER_SIZE = 65536;
+                char buffer[BUFFER_SIZE];
+
+                while (!stream->done()) {
+                    std::size_t bytes_read = stream->read(buffer, BUFFER_SIZE);
+                    if (bytes_read == 0) break;
+
+                    // Parse JSON line
+                    yyjson_doc* doc =
+                        yyjson_read(buffer, bytes_read, YYJSON_READ_NOFLAG);
+                    if (doc) {
+                        yyjson_val* event = yyjson_doc_get_root(doc);
+                        association_tracker.extract_from_event(event,
+                                                               input.config);
+                        yyjson_doc_free(doc);
+                    }
+                }
+            }
+
+            // Finalize association tracker (sort intervals, etc.)
+            association_tracker.finalize();
+
+            DFTRACER_UTILS_LOG_INFO(
+                "Association extraction complete. Process relationships: %s, "
+                "Boundary events: %s",
+                association_tracker.has_process_tree() ? "yes" : "no",
+                association_tracker.has_boundary_events() ? "yes" : "no");
+        }
+
+        // PASS 2: Process each metadata file for aggregation
         for (const auto& meta : input.metadata) {
             if (!meta.success) {
                 DFTRACER_UTILS_LOG_WARN("Skipping unsuccessful file: %s",
@@ -258,11 +350,11 @@ class EventAggregatorUtility
             }
 
             // Process each line (event)
-            constexpr size_t BUFFER_SIZE = 65536;  // 64KB buffer
+            constexpr std::size_t BUFFER_SIZE = 65536;  // 64KB buffer
             char buffer[BUFFER_SIZE];
 
             while (!stream->done()) {
-                size_t bytes_read = stream->read(buffer, BUFFER_SIZE);
+                std::size_t bytes_read = stream->read(buffer, BUFFER_SIZE);
                 if (bytes_read == 0) break;
 
                 // Parse JSON line using yyjson
@@ -275,7 +367,7 @@ class EventAggregatorUtility
                 yyjson_val* root = yyjson_doc_get_root(doc);
                 if (root && yyjson_is_obj(root)) {
                     process_event(root, rank, meta.file_path, input.config,
-                                  local_aggregations);
+                                  association_tracker, local_aggregations);
                     output.total_events_processed++;
                 }
 
