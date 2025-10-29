@@ -39,3 +39,45 @@
 
 # debug information files
 *.dwo
+
+.cpmsource
+.direnv
+build
+dict_analyzer*
+*.pfw.gz
+*.pfw.gz.idx
+install
+
+build_*
+coverage/
+.venv
+*venv*
+
+*.egg-info
+.cpmsource
+_skbuild
+*.pyd
+__pycache__
+build
+.vscode
+.vs
+/dist
+*.idx
+*.zindex
+.claude
+CLAUDE.md
+TODO
+temp
+
+*.gz
+traces
+refs
+dfanalyzer
+*.ipynb
+_version.py
+venv
+
+# Documentation
+docs/build/
+docs/doxygen/
+docs/source/**/_autosummary/
