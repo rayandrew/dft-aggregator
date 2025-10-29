@@ -44,5 +44,17 @@ include(CPM)
 include(Dependencies)
 
 need_dftracer_utils()
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Add executable
 add_executable(dftracer_aggregator src/main.cpp)
-target_link_directories(dftracer_aggregator PUBLIC dftracer_utils::shared)
+
+# Link libraries
+target_link_libraries(dftracer_aggregator PUBLIC dftracer_utils::shared  argparse::argparse
+                                              ghc_filesystem)
+
+# Include directories
+target_include_directories(dftracer_aggregator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
