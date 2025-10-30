@@ -502,10 +502,11 @@ class ChunkAggregatorUtility
                             end_time - start_time)
                             .count();
 
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
         // Log completion for every chunk (INFO level)
         if (input.chunk_index % 100 == 0 || output.events_processed > 0) {
             auto thread_id = std::this_thread::get_id();
-            DFTRACER_UTILS_LOG_INFO(
+            DFTRACER_UTILS_LOG_DEBUG(
                 "[Thread %zu] Chunk %d DONE: %zu events → %zu keys in %ld ms "
                 "(%.2f events/sec)",
                 std::hash<std::thread::id>{}(thread_id), input.chunk_index,
@@ -513,7 +514,6 @@ class ChunkAggregatorUtility
                 duration > 0 ? (output.events_processed * 1000.0 / duration)
                              : 0.0);
 
-#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
             // Calculate timing breakdown percentages (debug only)
             long long total_time_us = duration * 1000;  // ms to us
             double io_pct = (total_time_us > 0)
@@ -578,8 +578,8 @@ class ChunkAggregatorUtility
                 total_build_key_time_us / 1000, hash_pct,
                 total_hash_lookup_time_us / 1000, metrics_pct,
                 total_metrics_update_time_us / 1000);
-#endif
         }
+#endif
 
         return output;
     }
