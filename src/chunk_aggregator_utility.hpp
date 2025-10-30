@@ -143,7 +143,9 @@ class ChunkAggregatorUtility
         const AggregationConfig& config,
         std::unordered_map<AggregationKey, AggregationMetrics,
                            AggregationKeyHash>& local_aggregations,
-        const std::shared_ptr<AssociationTracker>& local_tracker) {
+        const std::shared_ptr<AssociationTracker>& local_tracker,
+        long long& assoc_time_us, long long& build_key_time_us,
+        long long& hash_lookup_time_us, long long& metrics_update_time_us) {
         JsonParserUtility parser;
         JsonValue json = parser.process(event);
 
@@ -155,7 +157,13 @@ class ChunkAggregatorUtility
 
         // Extract associations from this event (fork/spawn, boundary events)
         if (local_tracker) {
+            auto assoc_start = std::chrono::high_resolution_clock::now();
             local_tracker->extract_from_event(event, config);
+            auto assoc_end = std::chrono::high_resolution_clock::now();
+            assoc_time_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    assoc_end - assoc_start)
+                    .count();
         }
 
         // Filter by category if specified
@@ -179,12 +187,26 @@ class ChunkAggregatorUtility
         }
 
         // Build key
+        auto build_key_start = std::chrono::high_resolution_clock::now();
         AggregationKey key = build_key(event, config, local_tracker);
+        auto build_key_end = std::chrono::high_resolution_clock::now();
+        build_key_time_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                build_key_end - build_key_start)
+                .count();
 
         // Get or create metrics entry
+        auto hash_start = std::chrono::high_resolution_clock::now();
         auto& metrics = local_aggregations[key];
+        auto hash_end = std::chrono::high_resolution_clock::now();
+        hash_lookup_time_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(hash_end -
+                                                                   hash_start)
+                .count();
 
-        // Extract event data
+        // Extract event data and update metrics
+        auto metrics_start = std::chrono::high_resolution_clock::now();
+
         std::uint64_t duration = json["dur"].get<std::uint64_t>();
         std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
         std::uint64_t size = 0;
@@ -229,6 +251,12 @@ class ChunkAggregatorUtility
                 metrics.parent_pid = local_tracker->get_parent_pid(pid);
             }
         }
+
+        auto metrics_end = std::chrono::high_resolution_clock::now();
+        metrics_update_time_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(metrics_end -
+                                                                   metrics_start)
+                .count();
     }
 
    public:
@@ -333,6 +361,12 @@ class ChunkAggregatorUtility
         long long total_process_time_us = 0;
         long long total_loop_overhead_us = 0;
 
+        // Detailed breakdown of process_event() time
+        long long total_assoc_time_us = 0;
+        long long total_build_key_time_us = 0;
+        long long total_hash_lookup_time_us = 0;
+        long long total_metrics_update_time_us = 0;
+
         while (!stream->done()) {
             auto io_start = std::chrono::high_resolution_clock::now();
             std::size_t bytes_read =
@@ -382,7 +416,10 @@ class ChunkAggregatorUtility
                                 std::chrono::high_resolution_clock::now();
                             process_event(root, input.rank, input.file_path,
                                           input.config, local_aggregations,
-                                          local_tracker);
+                                          local_tracker, total_assoc_time_us,
+                                          total_build_key_time_us,
+                                          total_hash_lookup_time_us,
+                                          total_metrics_update_time_us);
                             auto process_end =
                                 std::chrono::high_resolution_clock::now();
                             total_process_time_us +=
@@ -475,6 +512,33 @@ class ChunkAggregatorUtility
                 io_pct, total_io_time_us / 1000, parse_pct,
                 total_json_parse_time_us / 1000, process_pct,
                 total_process_time_us / 1000, other_pct);
+
+            // Log detailed breakdown of Process time
+            double assoc_pct = (total_time_us > 0)
+                                   ? (total_assoc_time_us * 100.0 / total_time_us)
+                                   : 0;
+            double build_key_pct =
+                (total_time_us > 0)
+                    ? (total_build_key_time_us * 100.0 / total_time_us)
+                    : 0;
+            double hash_pct = (total_time_us > 0)
+                                  ? (total_hash_lookup_time_us * 100.0 /
+                                     total_time_us)
+                                  : 0;
+            double metrics_pct =
+                (total_time_us > 0)
+                    ? (total_metrics_update_time_us * 100.0 / total_time_us)
+                    : 0;
+
+            DFTRACER_UTILS_LOG_INFO(
+                "[Thread %zu] Chunk %d PROCESS DETAIL: Assoc=%.1f%% (%lld "
+                "ms), BuildKey=%.1f%% (%lld ms), HashLookup=%.1f%% (%lld ms), "
+                "MetricsUpdate=%.1f%% (%lld ms)",
+                std::hash<std::thread::id>{}(thread_id), input.chunk_index,
+                assoc_pct, total_assoc_time_us / 1000, build_key_pct,
+                total_build_key_time_us / 1000, hash_pct,
+                total_hash_lookup_time_us / 1000, metrics_pct,
+                total_metrics_update_time_us / 1000);
         }
 
         return output;
