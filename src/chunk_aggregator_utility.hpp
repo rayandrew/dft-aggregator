@@ -6,7 +6,9 @@
 #include <dftracer/utils/utilities/composites/indexed_file_reader.h>
 #include <yyjson.h>
 
+#include <chrono>
 #include <string_view>
+#include <thread>
 
 #include "aggregation_output.hpp"
 #include "association_tracker.hpp"
@@ -224,15 +226,20 @@ class ChunkAggregatorUtility
     }
 
     ChunkAggregationOutput process(const ChunkAggregatorInput& input) override {
+        auto start_time = std::chrono::high_resolution_clock::now();
+
         ChunkAggregationOutput output;
         output.chunk_index = input.chunk_index;
         output.events_processed = 0;
         output.success = false;
 
-        DFTRACER_UTILS_LOG_DEBUG(
-            "Chunk %d: Aggregating events from %s [bytes %zu-%zu]",
-            input.chunk_index, input.file_path.c_str(), input.start_byte,
-            input.end_byte);
+        // Log progress for every chunk (INFO level for visibility)
+        if (input.chunk_index % 100 == 0) {
+            DFTRACER_UTILS_LOG_INFO("Starting chunk %d/%d: %s [bytes %zu-%zu]",
+                                    input.chunk_index, 9608,
+                                    input.file_path.c_str(), input.start_byte,
+                                    input.end_byte);
+        }
 
         // Create indexed file reader
         auto reader_input =
@@ -267,28 +274,43 @@ class ChunkAggregatorUtility
                            AggregationKeyHash>
             local_aggregations;
 
-        // Process each line (event)
-        constexpr std::size_t BUFFER_SIZE = 65536;  // 64KB buffer
-        char buffer[BUFFER_SIZE];
+        // Reserve space for likely number of keys to reduce rehashing
+        local_aggregations.reserve(10000);
+
+        // Process each line (event) - optimized batch processing
+        constexpr std::size_t BUFFER_SIZE = 65536;  // 64KB buffer per line
+        std::vector<char> buffer(BUFFER_SIZE);
+        std::size_t lines_processed = 0;
+        std::size_t batch_size = 0;
+        constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k events
 
         while (!stream->done()) {
-            std::size_t bytes_read = stream->read(buffer, BUFFER_SIZE);
+            std::size_t bytes_read = stream->read(buffer.data(), BUFFER_SIZE);
             if (bytes_read == 0) break;
 
-            // Null-terminate for safety
-            if (bytes_read < BUFFER_SIZE) {
-                buffer[bytes_read] = '\0';
-            }
+            // Parse JSON line (in-situ for better performance)
+            yyjson_read_flag flg = YYJSON_READ_INSITU | YYJSON_READ_NOFLAG;
+            yyjson_doc* doc = yyjson_read_opts(buffer.data(), bytes_read, flg,
+                                               nullptr, nullptr);
 
-            // Parse JSON line
-            yyjson_doc* doc =
-                yyjson_read(buffer, bytes_read, YYJSON_READ_NOFLAG);
             if (doc) {
                 yyjson_val* root = yyjson_doc_get_root(doc);
                 if (root && yyjson_is_obj(root)) {
                     process_event(root, input.rank, input.file_path,
                                   input.config, local_aggregations);
                     output.events_processed++;
+                    lines_processed++;
+
+                    // Progress logging
+                    if (lines_processed % LOG_INTERVAL == 0) {
+                        auto thread_id = std::this_thread::get_id();
+                        DFTRACER_UTILS_LOG_INFO(
+                            "[Thread %zu] Chunk %d: Processed %zu events, %zu "
+                            "unique keys",
+                            std::hash<std::thread::id>{}(thread_id),
+                            input.chunk_index, lines_processed,
+                            local_aggregations.size());
+                    }
                 }
                 yyjson_doc_free(doc);
             }
@@ -298,10 +320,23 @@ class ChunkAggregatorUtility
         output.aggregations = std::move(local_aggregations);
         output.success = true;
 
-        DFTRACER_UTILS_LOG_DEBUG(
-            "Chunk %d: Aggregated %zu events into %zu unique keys",
-            input.chunk_index, output.events_processed,
-            output.aggregations.size());
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            end_time - start_time)
+                            .count();
+
+        auto thread_id = std::this_thread::get_id();
+
+        // Log completion for every chunk (INFO level)
+        if (input.chunk_index % 100 == 0 || output.events_processed > 0) {
+            DFTRACER_UTILS_LOG_INFO(
+                "[Thread %zu] Chunk %d DONE: %zu events → %zu keys in %ld ms "
+                "(%.2f events/sec)",
+                std::hash<std::thread::id>{}(thread_id), input.chunk_index,
+                output.events_processed, output.aggregations.size(), duration,
+                duration > 0 ? (output.events_processed * 1000.0 / duration)
+                             : 0.0);
+        }
 
         return output;
     }
