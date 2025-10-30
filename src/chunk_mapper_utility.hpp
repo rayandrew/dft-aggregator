@@ -17,7 +17,8 @@ struct ChunkMapperInput {
         metadata;
     AggregationConfig config;
     std::size_t checkpoint_size;
-    std::size_t target_chunk_size_mb;  // Target size per chunk in MB
+    std::size_t target_chunk_size_mb;
+    std::size_t batch_size = 4 * 1024 * 1024;
 
     static ChunkMapperInput from_metadata(
         const std::vector<
@@ -40,6 +41,11 @@ struct ChunkMapperInput {
 
     ChunkMapperInput& with_target_chunk_size(std::size_t size_mb) {
         target_chunk_size_mb = size_mb;
+        return *this;
+    }
+
+    ChunkMapperInput& with_batch_size(std::size_t size_bytes) {
+        batch_size = size_bytes;
         return *this;
     }
 };
@@ -109,8 +115,7 @@ class ChunkMapperUtility
                 std::size_t end_byte =
                     std::min((i + 1) * target_chunk_bytes, file_size);
 
-                // Estimate line ranges (approximate - actual lines determined
-                // by LINE_BYTES read)
+                // Estimate line ranges
                 std::size_t start_line = (num_lines * start_byte) / file_size;
                 std::size_t end_line = (num_lines * end_byte) / file_size;
 
@@ -123,7 +128,8 @@ class ChunkMapperUtility
                     start_line, end_line, global_chunk_index, rank);
 
                 chunk.with_config(input.config)
-                    .with_checkpoint_size(input.checkpoint_size);
+                    .with_checkpoint_size(input.checkpoint_size)
+                    .with_batch_size(input.batch_size);
 
                 chunks.push_back(chunk);
                 global_chunk_index++;

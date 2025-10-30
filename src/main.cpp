@@ -12,9 +12,7 @@
 #include <thread>
 
 #include "aggregation_config.hpp"
-#include "association_merger_utility.hpp"
 #include "chunk_aggregator_utility.hpp"
-#include "chunk_association_extractor_utility.hpp"
 #include "chunk_mapper_utility.hpp"
 #include "event_aggregator_utility.hpp"
 #include "perfetto_writer.hpp"
@@ -123,6 +121,13 @@ int main(int argc, char** argv) {
         .scan<'d', std::size_t>()
         .default_value(static_cast<std::size_t>(4));
 
+    program.add_argument("--read-batch-size")
+        .help(
+            "Batch read size in MB for stream processing (default: 4, higher = "
+            "faster but more memory)")
+        .scan<'d', std::size_t>()
+        .default_value(static_cast<std::size_t>(4));
+
     try {
         program.parse_args(argc, argv);
     } catch (const std::exception& err) {
@@ -153,6 +158,7 @@ int main(int argc, char** argv) {
         program.get<std::string>("--boundary-events");
     bool no_track_parents = program.get<bool>("--no-track-process-parents");
     std::size_t chunk_size_mb = program.get<std::size_t>("--chunk-size");
+    std::size_t batch_size_mb = program.get<std::size_t>("--read-batch-size");
 
     // Automatically add .gz extension if compressing and not already present
     if (compress_output) {
@@ -368,7 +374,7 @@ int main(int argc, char** argv) {
     using ChunkMappingInput = MetadataCollectOutput;
 
     auto create_chunk_mappings_func =
-        [agg_config, checkpoint_size, chunk_size_mb](
+        [agg_config, checkpoint_size, chunk_size_mb, batch_size_mb](
             const ChunkMappingInput& metadata_output) -> ChunkMapperOutput {
         DFTRACER_UTILS_LOG_INFO("Creating chunk mappings from %zu files...",
                                 metadata_output.results.size());
@@ -378,7 +384,9 @@ int main(int argc, char** argv) {
             ChunkMapperInput::from_metadata(metadata_output.results)
                 .with_config(agg_config)
                 .with_checkpoint_size(checkpoint_size)
-                .with_target_chunk_size(chunk_size_mb);
+                .with_target_chunk_size(chunk_size_mb)
+                .with_batch_size(batch_size_mb * 1024 *
+                                 1024);  // Convert MB to bytes
 
         auto chunks = mapper.process(mapper_input);
 
@@ -391,99 +399,28 @@ int main(int argc, char** argv) {
         make_task(create_chunk_mappings_func, "CreateChunkMappings");
 
     // ========================================================================
-    // Task 4: Extract Associations (Pass 1 - Parallel)
+    // Task 4: Aggregate Events (Single-pass: Extract associations while
+    // aggregating)
     // ========================================================================
     DFTRACER_UTILS_LOG_INFO(
-        "%s", "Task 4: Configuring parallel association extraction...");
+        "%s",
+        "Task 4: Configuring parallel event aggregation (single-pass)...");
 
-    auto association_extractor_workflow =
-        std::make_shared<ChunkAssociationExtractorUtility>();
-
-    auto association_batch_processor =
-        std::make_shared<utilities::composites::BatchProcessorUtility<
-            ChunkAggregatorInput, ChunkAssociationOutput>>(
-            association_extractor_workflow);
-
-    auto task4_extract_associations =
-        utilities::use(association_batch_processor).as_task();
-    task4_extract_associations->with_name("ExtractAssociations");
-
-    // ========================================================================
-    // Task 5: Merge Association Trackers
-    // ========================================================================
-    DFTRACER_UTILS_LOG_INFO("%s", "Task 5: Configuring association merge...");
-
-    auto association_merger = std::make_shared<AssociationMergerUtility>();
-    auto merge_associations_func =
-        [association_merger](
-            const std::vector<ChunkAssociationOutput>& chunk_outputs)
-        -> AssociationMergerUtilityOutput {
-        AssociationMergerUtilityInput input;
-        input.chunk_outputs = chunk_outputs;
-        return association_merger->process(input);
-    };
-
-    auto task5_merge_associations =
-        make_task(merge_associations_func, "MergeAssociations");
-
-    // ========================================================================
-    // Task 6: Aggregate Events (Pass 2 - Parallel with Merged Tracker)
-    // ========================================================================
-    DFTRACER_UTILS_LOG_INFO(
-        "%s", "Task 6: Configuring parallel event aggregation...");
-
-    // Store merged tracker to be accessible in aggregation
-    auto shared_tracker = std::make_shared<AssociationTracker>();
-
-    // Task 5b: Store the merged tracker for use by Task 6
-    auto store_tracker_func =
-        [shared_tracker](const AssociationMergerUtilityOutput& merger_output)
-        -> AssociationMergerUtilityOutput {
-        *shared_tracker = merger_output.merged_tracker;
-        DFTRACER_UTILS_LOG_INFO("Stored merged association tracker");
-        return merger_output;
-    };
-    auto task5b_store_tracker = make_task(store_tracker_func, "StoreTracker");
-
-    // Task 3b: Store chunks for use by Task 6
-    auto shared_chunks = std::make_shared<ChunkMapperOutput>();
-    auto store_chunks_func =
-        [shared_chunks](const ChunkMapperOutput& chunks) -> ChunkMapperOutput {
-        *shared_chunks = chunks;
-        DFTRACER_UTILS_LOG_INFO("Stored %zu chunks for aggregation",
-                                chunks.size());
-        return chunks;
-    };
-    auto task3b_store_chunks = make_task(store_chunks_func, "StoreChunks");
-
-    // Task 6: Aggregate chunks in parallel
-    // Create the aggregator and batch processor
+    // Create the aggregator (always single-pass now)
     auto aggregator_workflow = std::make_shared<ChunkAggregatorUtility>();
 
     auto aggregator_batch_processor =
         std::make_shared<utilities::composites::BatchProcessorUtility<
             ChunkAggregatorInput, ChunkAggregationOutput>>(aggregator_workflow);
 
-    auto task6_aggregate_chunks =
+    auto task4_aggregate_chunks =
         utilities::use(aggregator_batch_processor).as_task();
-    task6_aggregate_chunks->with_name("AggregateChunks");
-
-    // Combiner that sets the tracker and provides chunks
-    task6_aggregate_chunks->with_combiner(
-        [shared_tracker, shared_chunks,
-         aggregator_workflow](const AssociationMergerUtilityOutput&) {
-            // Set tracker on the aggregator before processing
-            aggregator_workflow->set_association_tracker(shared_tracker.get());
-            DFTRACER_UTILS_LOG_INFO(
-                "Aggregating %zu chunks in parallel with merged tracker",
-                shared_chunks->size());
-            return *shared_chunks;
-        });
+    task4_aggregate_chunks->with_name("AggregateChunks");
 
     // ========================================================================
-    // Task 7: Merge Aggregations
+    // Task 5: Merge Aggregations (and associations from single-pass)
     // ========================================================================
-    DFTRACER_UTILS_LOG_INFO("%s", "Task 7: Configuring aggregation merge...");
+    DFTRACER_UTILS_LOG_INFO("%s", "Task 5: Configuring aggregation merge...");
 
     auto event_aggregator = std::make_shared<EventAggregatorUtility>();
     auto merge_aggregations_func =
@@ -495,13 +432,13 @@ int main(int argc, char** argv) {
         return event_aggregator->process(input);
     };
 
-    auto task7_merge_aggregations =
+    auto task5_merge_aggregations =
         make_task(merge_aggregations_func, "MergeAggregations");
 
     // ========================================================================
-    // Task 8: Write Output
+    // Task 6: Write Output
     // ========================================================================
-    DFTRACER_UTILS_LOG_INFO("%s", "Task 8: Writing output...");
+    DFTRACER_UTILS_LOG_INFO("%s", "Task 6: Writing output...");
 
     auto write_output_func =
         [&output_file, &agg_config, compress_output, compression_level](
@@ -539,49 +476,36 @@ int main(int argc, char** argv) {
         return success;
     };
 
-    auto task8_write_output = make_task(write_output_func, "WriteOutput");
+    auto task6_write_output = make_task(write_output_func, "WriteOutput");
 
     // ========================================================================
-    // Execute Pipeline
+    // Execute Pipeline (SINGLE-PASS MODE)
     // ========================================================================
 
     // Define dependencies
     task2_collect_metadata->depends_on(task1_build_indexes);
     task3_create_chunks->depends_on(task2_collect_metadata);
 
-    // Task 3b stores chunks for later use by Task 6
-    task3b_store_chunks->depends_on(task3_create_chunks);
+    // Task 4 aggregates chunks
+    task4_aggregate_chunks->depends_on(task3_create_chunks);
 
-    // Task 4 extracts associations from chunks (parallel)
-    task4_extract_associations->depends_on(task3b_store_chunks);
+    // Task 5 merges aggregation results from Task 4
+    task5_merge_aggregations->depends_on(task4_aggregate_chunks);
 
-    // Task 5 merges association trackers from Task 4
-    task5_merge_associations->depends_on(task4_extract_associations);
-
-    // Task 5b stores merged tracker for Task 6
-    task5b_store_tracker->depends_on(task5_merge_associations);
-
-    // Task 6 aggregates chunks using merged tracker (parallel)
-    // It depends on Task 5b (stored tracker)
-    task6_aggregate_chunks->depends_on(task5b_store_tracker);
-
-    // Task 7 merges aggregation results from Task 6
-    task7_merge_aggregations->depends_on(task6_aggregate_chunks);
-
-    // Task 8 writes output
-    task8_write_output->depends_on(task7_merge_aggregations);
+    // Task 6 writes output
+    task6_write_output->depends_on(task5_merge_aggregations);
 
     // Set up pipeline
     pipeline.set_source(task1_build_indexes);
-    pipeline.set_destination(task8_write_output);
+    pipeline.set_destination(task6_write_output);
 
     // Execute pipeline with initial input
     pipeline.execute(index_dir_input);
 
     // Get final results
     auto agg_results =
-        task7_merge_aggregations->get<EventAggregatorUtilityOutput>();
-    auto write_success = task8_write_output->get<bool>();
+        task5_merge_aggregations->get<EventAggregatorUtilityOutput>();
+    auto write_success = task6_write_output->get<bool>();
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> duration = end_time - start_time;

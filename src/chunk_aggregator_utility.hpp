@@ -30,6 +30,9 @@ struct ChunkAggregatorInput {
     int chunk_index;  // For tracking/debugging
     int rank;         // Extracted from filename
 
+    // Performance tuning
+    std::size_t batch_size = 4 * 1024 * 1024;
+
     // Builder pattern
     static ChunkAggregatorInput from_metadata(
         const std::string& file_path, const std::string& idx_path,
@@ -56,6 +59,11 @@ struct ChunkAggregatorInput {
         checkpoint_size = size;
         return *this;
     }
+
+    ChunkAggregatorInput& with_batch_size(std::size_t size) {
+        batch_size = size;
+        return *this;
+    }
 };
 
 // Output from association extraction for a chunk
@@ -66,20 +74,14 @@ struct ChunkAssociationOutput {
     bool success;
 };
 
-// Utility that aggregates events from a single chunk (byte range) using
-// thread-local maps
+// Utility that aggregates events from a single chunk (byte range)
 class ChunkAggregatorUtility
     : public utilities::Utility<ChunkAggregatorInput, ChunkAggregationOutput,
                                 utilities::tags::Parallelizable> {
    private:
-    // Shared association tracker (read-only after Pass 1 merge)
-    const AssociationTracker* association_tracker_;
-
-    // Thread-local reusable buffer for batch reading (4MB)
-    static constexpr std::size_t BATCH_SIZE = 4 * 1024 * 1024;
+    // Thread-local reusable buffer for batch reading (resized as needed)
     thread_local static std::vector<char> read_buffer_;
 
-    // Helper: Compute time bucket
     std::uint64_t compute_time_bucket(std::uint64_t timestamp,
                                       const AggregationConfig& config) const {
         if (config.use_relative_time) {
@@ -89,8 +91,9 @@ class ChunkAggregatorUtility
     }
 
     // Helper: Build aggregation key from yyjson event
-    AggregationKey build_key(yyjson_val* event,
-                             const AggregationConfig& config) const {
+    AggregationKey build_key(
+        yyjson_val* event, const AggregationConfig& config,
+        const std::shared_ptr<AssociationTracker>& local_tracker) const {
         AggregationKey key;
 
         // Use JsonParserUtility (stack allocation)
@@ -121,11 +124,11 @@ class ChunkAggregatorUtility
             }
         }
 
-        // Add boundary associations (epoch, step, etc.) to the key for proper
-        // grouping
-        if (association_tracker_ && !config.boundary_events.empty()) {
-            auto associations = association_tracker_->get_boundary_associations(
-                key.pid, timestamp);
+        // Add boundary associations (epoch, step, etc.)
+        // to the key for proper grouping
+        if (local_tracker && !config.boundary_events.empty()) {
+            auto associations =
+                local_tracker->get_boundary_associations(key.pid, timestamp);
             for (const auto& [assoc_name, assoc_value] : associations) {
                 key.extra_keys[assoc_name] = assoc_value;
             }
@@ -139,7 +142,8 @@ class ChunkAggregatorUtility
         yyjson_val* event, int rank, const std::string& trace_file,
         const AggregationConfig& config,
         std::unordered_map<AggregationKey, AggregationMetrics,
-                           AggregationKeyHash>& local_aggregations) {
+                           AggregationKeyHash>& local_aggregations,
+        const std::shared_ptr<AssociationTracker>& local_tracker) {
         JsonParserUtility parser;
         JsonValue json = parser.process(event);
 
@@ -147,6 +151,11 @@ class ChunkAggregatorUtility
         std::string_view ph = json["ph"].get<std::string_view>();
         if (ph == "M") {
             return;
+        }
+
+        // Extract associations from this event (fork/spawn, boundary events)
+        if (local_tracker) {
+            local_tracker->extract_from_event(event, config);
         }
 
         // Filter by category if specified
@@ -170,7 +179,7 @@ class ChunkAggregatorUtility
         }
 
         // Build key
-        AggregationKey key = build_key(event, config);
+        AggregationKey key = build_key(event, config, local_tracker);
 
         // Get or create metrics entry
         auto& metrics = local_aggregations[key];
@@ -210,25 +219,20 @@ class ChunkAggregatorUtility
             std::uint64_t ts = json["ts"].get<std::uint64_t>();
 
             // Get boundary associations (epoch, step, etc.)
-            if (association_tracker_ && !config.boundary_events.empty()) {
+            if (local_tracker && !config.boundary_events.empty()) {
                 metrics.boundary_associations =
-                    association_tracker_->get_boundary_associations(pid, ts);
+                    local_tracker->get_boundary_associations(pid, ts);
             }
 
             // Get parent PID if tracking process relationships
-            if (association_tracker_ && config.track_process_parents) {
-                metrics.parent_pid = association_tracker_->get_parent_pid(pid);
+            if (local_tracker && config.track_process_parents) {
+                metrics.parent_pid = local_tracker->get_parent_pid(pid);
             }
         }
     }
 
    public:
-    ChunkAggregatorUtility() : association_tracker_(nullptr) {}
-
-    // Set the shared association tracker (must be called before process())
-    void set_association_tracker(const AssociationTracker* tracker) {
-        association_tracker_ = tracker;
-    }
+    ChunkAggregatorUtility() = default;
 
     ChunkAggregationOutput process(const ChunkAggregatorInput& input) override {
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -307,12 +311,25 @@ class ChunkAggregatorUtility
         // Reserve space for likely number of keys to reduce rehashing
         local_aggregations.reserve(10000);
 
+        // Create a local association tracker
+        // only if association tracking is enabled
+        std::shared_ptr<AssociationTracker> local_tracker;
+        if (input.config.track_process_parents ||
+            !input.config.boundary_events.empty()) {
+            local_tracker = std::make_shared<AssociationTracker>();
+        }
+
+        // Resize buffer if needed (reuse existing buffer when possible)
+        if (read_buffer_.size() < input.batch_size) {
+            read_buffer_.resize(input.batch_size);
+        }
+
         std::size_t lines_processed = 0;
         constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k events
 
         while (!stream->done()) {
             std::size_t bytes_read =
-                stream->read(read_buffer_.data(), BATCH_SIZE);
+                stream->read(read_buffer_.data(), input.batch_size);
             if (bytes_read == 0) break;
 
             const char* data = read_buffer_.data();
@@ -325,7 +342,6 @@ class ChunkAggregatorUtility
                     memchr(line_start, '\n', bytes_read - pos));
 
                 if (!newline) {
-                    // No more lines in this buffer
                     break;
                 }
 
@@ -342,7 +358,8 @@ class ChunkAggregatorUtility
                         yyjson_val* root = yyjson_doc_get_root(doc);
                         if (root && yyjson_is_obj(root)) {
                             process_event(root, input.rank, input.file_path,
-                                          input.config, local_aggregations);
+                                          input.config, local_aggregations,
+                                          local_tracker);
                             output.events_processed++;
                             lines_processed++;
 
@@ -350,7 +367,8 @@ class ChunkAggregatorUtility
                             if (lines_processed % LOG_INTERVAL == 0) {
                                 auto thread_id = std::this_thread::get_id();
                                 DFTRACER_UTILS_LOG_INFO(
-                                    "[Thread %zu] Chunk %d: Processed %zu events, %zu unique keys",
+                                    "[Thread %zu] Chunk %d: Processed %zu "
+                                    "events, %zu unique keys",
                                     std::hash<std::thread::id>{}(thread_id),
                                     input.chunk_index, lines_processed,
                                     local_aggregations.size());
@@ -364,8 +382,11 @@ class ChunkAggregatorUtility
             }
         }
 
-        // Move local aggregations to output
         output.aggregations = std::move(local_aggregations);
+        if (local_tracker) {
+            local_tracker->finalize();
+            output.local_tracker = std::move(local_tracker);
+        }
         output.success = true;
 
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -390,6 +411,5 @@ class ChunkAggregatorUtility
     }
 };
 
-// Define thread-local static buffer
-thread_local std::vector<char> ChunkAggregatorUtility::read_buffer_(
-    ChunkAggregatorUtility::BATCH_SIZE);
+// Define thread-local static buffer (empty initially, resized on first use)
+thread_local std::vector<char> ChunkAggregatorUtility::read_buffer_;
