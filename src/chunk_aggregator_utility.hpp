@@ -92,7 +92,8 @@ class ChunkAggregatorUtility
 
     // Helper: Build aggregation key from JsonValue (reuse json wrapper)
     AggregationKey build_key(
-        const JsonValue& json, const AggregationConfig& config,
+        const JsonValue& json, const JsonValue& args, std::uint64_t timestamp,
+        const AggregationConfig& config,
         const std::shared_ptr<AssociationTracker>& local_tracker) const {
         AggregationKey key;
 
@@ -103,18 +104,17 @@ class ChunkAggregatorUtility
         key.tid = json["tid"].get<std::uint64_t>();
 
         // Extract from args
-        key.hhash = json["args"]["hhash"].get<std::string_view>();
-        key.fhash = json["args"]["fhash"].get<std::string_view>();
+        key.hhash = args["hhash"].get<std::string_view>();
+        key.fhash = args["fhash"].get<std::string_view>();
 
         // Time bucket
-        std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
         key.time_bucket = compute_time_bucket(timestamp, config);
 
         // Extra group keys
         if (!config.extra_group_keys.empty()) {
-            JsonValue args = json["args"];
             for (const auto& extra_key : config.extra_group_keys) {
-                std::string_view value = args[extra_key].get<std::string_view>();
+                std::string_view value =
+                    args[extra_key].get<std::string_view>();
                 if (!value.empty()) {
                     key.extra_keys[extra_key] = value;
                 }
@@ -182,9 +182,14 @@ class ChunkAggregatorUtility
             }
         }
 
+        // Pre-compute commonly accessed values to avoid redundant lookups
+        std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
+        JsonValue args = json["args"];
+
         // Build key
         auto build_key_start = std::chrono::high_resolution_clock::now();
-        AggregationKey key = build_key(json, config, local_tracker);
+        AggregationKey key =
+            build_key(json, args, timestamp, config, local_tracker);
         auto build_key_end = std::chrono::high_resolution_clock::now();
         build_key_time_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -197,32 +202,34 @@ class ChunkAggregatorUtility
         auto hash_end = std::chrono::high_resolution_clock::now();
         hash_lookup_time_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(hash_end -
-                                                                   hash_start)
+                                                                  hash_start)
                 .count();
 
         // Extract event data and update metrics
         auto metrics_start = std::chrono::high_resolution_clock::now();
 
         std::uint64_t duration = json["dur"].get<std::uint64_t>();
-        std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
         std::uint64_t size = 0;
 
         // Update metrics
         metrics.update_duration(duration);
         metrics.update_timestamp(timestamp);
 
-        // Handle size (from args.ret)
-        if (json["args"]["ret"].exists()) {
-            size = json["args"]["ret"].get<std::uint64_t>();
+        // Handle size (from args.ret) - reuse args
+        JsonValue ret = args["ret"];
+        if (ret.exists()) {
+            size = ret.get<std::uint64_t>();
             metrics.update_size(size);
         }
 
-        // Handle custom metrics
-        for (const auto& field : config.custom_metric_fields) {
-            std::string field_path = "args." + field;
-            if (json.at(field_path).exists()) {
-                std::uint64_t value = json.at(field_path).get<std::uint64_t>();
-                metrics.update_custom_metric(field, value);
+        // Handle custom metrics - reuse args JsonValue
+        if (!config.custom_metric_fields.empty()) {
+            for (const auto& field : config.custom_metric_fields) {
+                JsonValue field_val = args[field];
+                if (field_val.exists()) {
+                    std::uint64_t value = field_val.get<std::uint64_t>();
+                    metrics.update_custom_metric(field, value);
+                }
             }
         }
 
@@ -251,7 +258,7 @@ class ChunkAggregatorUtility
         auto metrics_end = std::chrono::high_resolution_clock::now();
         metrics_update_time_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(metrics_end -
-                                                                   metrics_start)
+                                                                  metrics_start)
                 .count();
     }
 
@@ -349,7 +356,8 @@ class ChunkAggregatorUtility
         }
 
         std::size_t lines_processed = 0;
-        // constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k events
+        // constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k
+        // events
 
         // Timing accumulators for profiling
         long long total_io_time_us = 0;
@@ -394,7 +402,8 @@ class ChunkAggregatorUtility
 
                 // Parse JSON line
                 if (line_len > 0) {
-                    auto parse_start = std::chrono::high_resolution_clock::now();
+                    auto parse_start =
+                        std::chrono::high_resolution_clock::now();
                     yyjson_read_flag flg = YYJSON_READ_NOFLAG;
                     yyjson_doc* doc =
                         yyjson_read_opts(const_cast<char*>(line_start),
@@ -468,11 +477,13 @@ class ChunkAggregatorUtility
 
         // Calculate timing breakdown percentages
         long long total_time_us = duration * 1000;  // ms to us
-        double io_pct =
-            (total_time_us > 0) ? (total_io_time_us * 100.0 / total_time_us) : 0;
-        double parse_pct = (total_time_us > 0)
-                               ? (total_json_parse_time_us * 100.0 / total_time_us)
-                               : 0;
+        double io_pct = (total_time_us > 0)
+                            ? (total_io_time_us * 100.0 / total_time_us)
+                            : 0;
+        double parse_pct =
+            (total_time_us > 0)
+                ? (total_json_parse_time_us * 100.0 / total_time_us)
+                : 0;
         double process_pct =
             (total_time_us > 0)
                 ? (total_process_time_us * 100.0 / total_time_us)
@@ -485,10 +496,10 @@ class ChunkAggregatorUtility
         // Note: loop_overhead includes parse + process time, so compute "other"
         double accounted_time_us =
             total_io_time_us + total_json_parse_time_us + total_process_time_us;
-        double other_pct = (total_time_us > 0)
-                               ? ((total_time_us - accounted_time_us) * 100.0 /
-                                  total_time_us)
-                               : 0;
+        double other_pct =
+            (total_time_us > 0)
+                ? ((total_time_us - accounted_time_us) * 100.0 / total_time_us)
+                : 0;
 
         // Log completion for every chunk (INFO level)
         if (input.chunk_index % 100 == 0 || output.events_processed > 0) {
@@ -510,17 +521,18 @@ class ChunkAggregatorUtility
                 total_process_time_us / 1000, other_pct);
 
             // Log detailed breakdown of Process time
-            double assoc_pct = (total_time_us > 0)
-                                   ? (total_assoc_time_us * 100.0 / total_time_us)
-                                   : 0;
+            double assoc_pct =
+                (total_time_us > 0)
+                    ? (total_assoc_time_us * 100.0 / total_time_us)
+                    : 0;
             double build_key_pct =
                 (total_time_us > 0)
                     ? (total_build_key_time_us * 100.0 / total_time_us)
                     : 0;
-            double hash_pct = (total_time_us > 0)
-                                  ? (total_hash_lookup_time_us * 100.0 /
-                                     total_time_us)
-                                  : 0;
+            double hash_pct =
+                (total_time_us > 0)
+                    ? (total_hash_lookup_time_us * 100.0 / total_time_us)
+                    : 0;
             double metrics_pct =
                 (total_time_us > 0)
                     ? (total_metrics_update_time_us * 100.0 / total_time_us)
