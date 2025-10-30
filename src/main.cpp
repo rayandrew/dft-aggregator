@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
                                .with_name("DFTracer Aggregator")
                                .with_executor_threads(executor_threads)
                                .with_scheduler_threads(scheduler_threads)
-                               .with_watchdog(false);
+                               .with_watchdog(true);
 
     Pipeline pipeline(pipeline_config);
 
