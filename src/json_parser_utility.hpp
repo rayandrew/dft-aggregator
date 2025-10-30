@@ -306,6 +306,14 @@ class JsonValue {
     yyjson_val* raw() const { return val_; }
 
     /**
+     * @brief Get raw yyjson_val pointer.
+     * @return Pointer to underlying yyjson value, or nullptr if not exists
+     *
+     * Use this for advanced operations or passing to yyjson API directly.
+     */
+    explicit operator yyjson_val*() const { return val_; }
+
+    /**
      * @brief Implicit conversion to bool (for existence checks).
      * @return true if value exists, false otherwise
      *
