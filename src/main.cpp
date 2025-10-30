@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "aggregation_config.hpp"
+#include "association_resolver_utility.hpp"
 #include "chunk_aggregator_utility.hpp"
 #include "chunk_mapper_utility.hpp"
 #include "event_aggregator_utility.hpp"
@@ -278,7 +279,6 @@ int main(int argc, char** argv) {
     agg_config.include_categories = include_categories;
     agg_config.include_names = include_names;
     agg_config.compute_statistics = true;
-    agg_config.include_trace_metadata = true;
     agg_config.boundary_events = boundary_events;
     agg_config.track_process_parents = !no_track_parents;
 
@@ -437,13 +437,34 @@ int main(int argc, char** argv) {
         make_task(merge_aggregations_func, "MergeAggregations");
 
     // ========================================================================
-    // Task 6: Write Output
+    // Task 6: Resolve Associations Globally
     // ========================================================================
-    DFTRACER_UTILS_LOG_INFO("%s", "Task 6: Writing output...");
+    DFTRACER_UTILS_LOG_INFO("%s", "Task 6: Resolving associations globally...");
+
+    auto resolve_associations_func =
+        [agg_config](const EventAggregatorUtilityOutput& merged_output)
+        -> AssociationResolverOutput {
+        AssociationResolverInput input;
+        input.aggregations = merged_output;
+        input.trackers = merged_output.trackers;
+        input.config = agg_config;
+
+        AssociationResolverUtility resolver;
+        return resolver.process(input);
+    };
+
+    auto task6_resolve_associations =
+        make_task(resolve_associations_func, "ResolveAssociations");
+
+    // ========================================================================
+    // Task 7: Write Output
+    // ========================================================================
+    DFTRACER_UTILS_LOG_INFO("%s", "Task 7: Writing output...");
 
     auto write_output_func =
         [&output_file, &agg_config, compress_output, compression_level](
-            const EventAggregatorUtilityOutput& agg_output) -> bool {
+            const AssociationResolverOutput& resolver_output) -> bool {
+        const auto& agg_output = resolver_output.aggregations;
         DFTRACER_UTILS_LOG_INFO("Writing %zu aggregation keys to %s%s...",
                                 agg_output.aggregations.size(),
                                 output_file.c_str(),
@@ -456,7 +477,7 @@ int main(int argc, char** argv) {
 
         PerfettoCounterWriter writer("aggregator_host");
         bool success = writer.write_aggregated_counters(
-            output_file, agg_output.aggregations, agg_config.compute_statistics,
+            output_file, resolver_output, agg_config.compute_statistics,
             compress_output, compression_level);
 
         if (success) {
@@ -477,7 +498,7 @@ int main(int argc, char** argv) {
         return success;
     };
 
-    auto task6_write_output = make_task(write_output_func, "WriteOutput");
+    auto task7_write_output = make_task(write_output_func, "WriteOutput");
 
     // ========================================================================
     // Execute Pipeline (SINGLE-PASS MODE)
@@ -493,20 +514,24 @@ int main(int argc, char** argv) {
     // Task 5 merges aggregation results from Task 4
     task5_merge_aggregations->depends_on(task4_aggregate_chunks);
 
-    // Task 6 writes output
-    task6_write_output->depends_on(task5_merge_aggregations);
+    // Task 6 resolves associations globally
+    task6_resolve_associations->depends_on(task5_merge_aggregations);
+
+    // Task 7 writes output
+    task7_write_output->depends_on(task6_resolve_associations);
 
     // Set up pipeline
     pipeline.set_source(task1_build_indexes);
-    pipeline.set_destination(task6_write_output);
+    pipeline.set_destination(task7_write_output);
 
     // Execute pipeline with initial input
     pipeline.execute(index_dir_input);
 
-    // Get final results
-    auto agg_results =
-        task5_merge_aggregations->get<EventAggregatorUtilityOutput>();
-    auto write_success = task6_write_output->get<bool>();
+    // Get final results (from Task 6 since it has the resolved data)
+    auto resolver_output =
+        task6_resolve_associations->get<AssociationResolverOutput>();
+    auto agg_results = resolver_output.aggregations;
+    auto write_success = task7_write_output->get<bool>();
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> duration = end_time - start_time;

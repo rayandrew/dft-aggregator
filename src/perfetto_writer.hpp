@@ -9,10 +9,12 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "aggregation_key.hpp"
 #include "aggregation_metrics.hpp"
+#include "association_resolver_utility.hpp"
 
 class PerfettoCounterWriter {
    private:
@@ -63,18 +65,34 @@ class PerfettoCounterWriter {
 
     void set_hostname_hash(const char* hhash) { hostname_hash_ = hhash; }
 
-    // Write all aggregated metrics as counter events using fprintf (fast!)
+    // Write all aggregated metrics as counter events
     bool write_aggregated_counters(
         const std::string& output_path,
-        const std::unordered_map<AggregationKey, AggregationMetrics,
-                                 AggregationKeyHash>& aggregations,
+        const AssociationResolverOutput& resolver_output,
         bool compute_statistics = true, bool compress = false,
         int compression_level = Z_DEFAULT_COMPRESSION) {
+        const auto& aggregations = resolver_output.aggregations.aggregations;
+        const auto& root_pids = resolver_output.root_pids;
         // Use a buffer to collect output before writing
         std::string buffer;
         buffer.reserve(1024 * 1024);  // Reserve 1MB initially
 
         buffer += "[\n";
+
+        // Emit metadata events for root processes first
+        if (!root_pids.empty()) {
+            for (std::uint64_t pid : root_pids) {
+                buffer +=
+                    "{\"name\":\"root_process\",\"cat\":\"dftracer\",\"ph\":"
+                    "\"M\",\"pid\":";
+                buffer += std::to_string(pid);
+                buffer += ",\"tid\":";
+                buffer += std::to_string(pid);
+                buffer += ",\"args\":{\"hhash\":\"";
+                buffer += hostname_hash_;
+                buffer += "\",\"is_root\":\"true\"}},\n";
+            }
+        }
 
         // Emit one counter event per aggregation bucket with all metrics in
         // args Note: No sorting needed - events are already grouped by

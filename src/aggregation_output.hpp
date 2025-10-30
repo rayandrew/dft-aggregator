@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "aggregation_key.hpp"
 #include "aggregation_metrics.hpp"
@@ -36,5 +37,7 @@ struct EventAggregatorUtilityOutput {
     std::size_t total_events_processed = 0;
     std::size_t total_files_processed = 0;
     std::size_t total_bytes_processed = 0;
+    std::vector<std::shared_ptr<AssociationTracker>>
+        trackers;  // Collected from all chunks for global resolution
     bool success = true;
 };

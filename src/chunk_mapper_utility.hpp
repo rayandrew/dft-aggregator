@@ -56,23 +56,6 @@ using ChunkMapperOutput = std::vector<ChunkAggregatorInput>;
 // Utility that splits files into chunks based on byte ranges from metadata
 class ChunkMapperUtility
     : public utilities::Utility<ChunkMapperInput, ChunkMapperOutput> {
-   private:
-    // Helper: Extract rank from filename
-    int extract_rank_from_filename(const std::string& filename) const {
-        std::size_t rank_pos = filename.find("rank_");
-        if (rank_pos != std::string::npos) {
-            std::size_t num_start = rank_pos + 5;
-            std::size_t num_end =
-                filename.find_first_not_of("0123456789", num_start);
-            if (num_end != std::string::npos) {
-                std::string rank_str =
-                    filename.substr(num_start, num_end - num_start);
-                return std::stoi(rank_str);
-            }
-        }
-        return -1;
-    }
-
    public:
     ChunkMapperOutput process(const ChunkMapperInput& input) override {
         ChunkMapperOutput chunks;
@@ -92,7 +75,6 @@ class ChunkMapperUtility
                 continue;
             }
 
-            int rank = extract_rank_from_filename(meta.file_path);
             std::size_t file_size = meta.uncompressed_size;
             std::size_t num_lines = meta.valid_events;
 
@@ -123,11 +105,13 @@ class ChunkMapperUtility
                 if (start_line == 0) start_line = 1;
                 if (end_line == 0) end_line = num_lines;
 
-                auto chunk = ChunkAggregatorInput::from_metadata(
-                    meta.file_path, meta.idx_path, start_byte, end_byte,
-                    start_line, end_line, global_chunk_index, rank);
-
-                chunk.with_config(input.config)
+                ChunkAggregatorInput chunk;
+                chunk.with_file_path(meta.file_path)
+                    .with_idx_path(meta.idx_path)
+                    .with_byte_range(start_byte, end_byte)
+                    .with_line_range(start_line, end_line)
+                    .with_chunk_index(global_chunk_index)
+                    .with_config(input.config)
                     .with_checkpoint_size(input.checkpoint_size)
                     .with_batch_size(input.batch_size);
 

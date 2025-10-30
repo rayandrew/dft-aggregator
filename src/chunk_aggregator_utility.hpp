@@ -28,26 +28,36 @@ struct ChunkAggregatorInput {
     AggregationConfig config;
     std::size_t checkpoint_size;
     int chunk_index;  // For tracking/debugging
-    int rank;         // Extracted from filename
 
     // Performance tuning
     std::size_t batch_size = 4 * 1024 * 1024;
 
-    // Builder pattern
-    static ChunkAggregatorInput from_metadata(
-        const std::string& file_path, const std::string& idx_path,
-        std::size_t start_byte, std::size_t end_byte, std::size_t start_line,
-        std::size_t end_line, int chunk_index, int rank) {
-        ChunkAggregatorInput input;
-        input.file_path = file_path;
-        input.idx_path = idx_path;
-        input.start_byte = start_byte;
-        input.end_byte = end_byte;
-        input.start_line = start_line;
-        input.end_line = end_line;
-        input.chunk_index = chunk_index;
-        input.rank = rank;
-        return input;
+    // Builder pattern - each field has its own builder method
+    ChunkAggregatorInput& with_file_path(const std::string& path) {
+        file_path = path;
+        return *this;
+    }
+
+    ChunkAggregatorInput& with_idx_path(const std::string& path) {
+        idx_path = path;
+        return *this;
+    }
+
+    ChunkAggregatorInput& with_byte_range(std::size_t start, std::size_t end) {
+        start_byte = start;
+        end_byte = end;
+        return *this;
+    }
+
+    ChunkAggregatorInput& with_line_range(std::size_t start, std::size_t end) {
+        start_line = start;
+        end_line = end;
+        return *this;
+    }
+
+    ChunkAggregatorInput& with_chunk_index(int index) {
+        chunk_index = index;
+        return *this;
     }
 
     ChunkAggregatorInput& with_config(const AggregationConfig& cfg) {
@@ -121,22 +131,12 @@ class ChunkAggregatorUtility
             }
         }
 
-        // Add boundary associations (epoch, step, etc.)
-        // to the key for proper grouping
-        if (local_tracker && !config.boundary_events.empty()) {
-            auto associations =
-                local_tracker->get_boundary_associations(key.pid, timestamp);
-            for (const auto& [assoc_name, assoc_value] : associations) {
-                key.extra_keys[assoc_name] = assoc_value;
-            }
-        }
-
         return key;
     }
 
     // Helper: Process a single event and update metrics
     void process_event(
-        yyjson_val* event, int rank, const std::string& trace_file,
+        yyjson_val* event, const std::string& trace_file,
         const AggregationConfig& config,
         std::unordered_map<AggregationKey, AggregationMetrics,
                            AggregationKeyHash>& local_aggregations,
@@ -151,12 +151,16 @@ class ChunkAggregatorUtility
             return;
         }
 
+        // Pre-compute commonly accessed values to avoid redundant lookups
+        std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
+        JsonValue args = json["args"];
+
         // Extract associations from this event (fork/spawn, boundary events)
         if (local_tracker) {
 #if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
             auto assoc_start = std::chrono::high_resolution_clock::now();
 #endif
-            local_tracker->extract_from_event(event, config);
+            local_tracker->extract_from_event(json, args, config);
 #if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
             auto assoc_end = std::chrono::high_resolution_clock::now();
             assoc_time_us +=
@@ -185,10 +189,6 @@ class ChunkAggregatorUtility
                 return;
             }
         }
-
-        // Pre-compute commonly accessed values to avoid redundant lookups
-        std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
-        JsonValue args = json["args"];
 
         // Build key
 #if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
@@ -244,28 +244,6 @@ class ChunkAggregatorUtility
                     std::uint64_t value = field_val.get<std::uint64_t>();
                     metrics.update_custom_metric(field, value);
                 }
-            }
-        }
-
-        // Track contributing sources
-        if (config.include_trace_metadata) {
-            metrics.add_contributing_source(rank, trace_file);
-        }
-
-        // Add association data if first time seeing this key
-        if (metrics.count == 1) {
-            std::uint64_t pid = json["pid"].get<std::uint64_t>();
-            std::uint64_t ts = json["ts"].get<std::uint64_t>();
-
-            // Get boundary associations (epoch, step, etc.)
-            if (local_tracker && !config.boundary_events.empty()) {
-                metrics.boundary_associations =
-                    local_tracker->get_boundary_associations(pid, ts);
-            }
-
-            // Get parent PID if tracking process relationships
-            if (local_tracker && config.track_process_parents) {
-                metrics.parent_pid = local_tracker->get_parent_pid(pid);
             }
         }
 
@@ -448,9 +426,9 @@ class ChunkAggregatorUtility
 #if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
                             auto process_start =
                                 std::chrono::high_resolution_clock::now();
-                            process_event(root, input.rank, input.file_path,
-                                          input.config, local_aggregations,
-                                          local_tracker, total_assoc_time_us,
+                            process_event(root, input.file_path, input.config,
+                                          local_aggregations, local_tracker,
+                                          total_assoc_time_us,
                                           total_build_key_time_us,
                                           total_hash_lookup_time_us,
                                           total_metrics_update_time_us);
@@ -465,10 +443,9 @@ class ChunkAggregatorUtility
                             // No timing parameters in release mode
                             long long dummy1 = 0, dummy2 = 0, dummy3 = 0,
                                       dummy4 = 0;
-                            process_event(root, input.rank, input.file_path,
-                                          input.config, local_aggregations,
-                                          local_tracker, dummy1, dummy2, dummy3,
-                                          dummy4);
+                            process_event(root, input.file_path, input.config,
+                                          local_aggregations, local_tracker,
+                                          dummy1, dummy2, dummy3, dummy4);
 #endif
 
                             output.events_processed++;

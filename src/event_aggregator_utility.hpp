@@ -44,6 +44,10 @@ class EventAggregatorUtility
             merged_output.total_bytes_processed += output.bytes_processed;
             unique_files.insert(output.file_path);
 
+            if (output.local_tracker) {
+                merged_output.trackers.push_back(output.local_tracker);
+            }
+
             // Merge aggregation maps
             for (const auto& [key, metrics] : output.aggregations) {
                 auto& merged_metrics = merged_output.aggregations[key];
@@ -62,6 +66,12 @@ class EventAggregatorUtility
                     std::min(merged_metrics.min_size, metrics.min_size);
                 merged_metrics.max_size =
                     std::max(merged_metrics.max_size, metrics.max_size);
+
+                // Update timestamp range
+                merged_metrics.first_ts =
+                    std::min(merged_metrics.first_ts, metrics.first_ts);
+                merged_metrics.last_ts =
+                    std::max(merged_metrics.last_ts, metrics.last_ts);
 
                 // For mean, recompute after merge using total/count
                 std::uint64_t new_count = merged_metrics.count;

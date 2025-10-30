@@ -34,7 +34,6 @@ struct AggregationConfig {
 
     // Options
     bool compute_statistics = true;
-    bool include_trace_metadata = true;
 
     // Association tracking
     std::vector<BoundaryEventConfig>

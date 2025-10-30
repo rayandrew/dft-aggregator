@@ -29,10 +29,6 @@ struct AggregationMetrics {
     std::uint64_t first_ts = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t last_ts = 0;
 
-    // Contributing sources
-    std::unordered_set<int> contributing_ranks;
-    std::unordered_set<std::string> contributing_traces;
-
     // Association data
     std::unordered_map<std::string, std::string>
         boundary_associations;     // e.g., {"epoch": "1", "step": "5"}
@@ -75,11 +71,6 @@ struct AggregationMetrics {
     void update_timestamp(std::uint64_t ts) {
         if (ts < first_ts) first_ts = ts;
         if (ts > last_ts) last_ts = ts;
-    }
-
-    void add_contributing_source(int rank, const std::string& trace_file) {
-        contributing_ranks.insert(rank);
-        contributing_traces.insert(trace_file);
     }
 
     void update_custom_metric(const std::string& name, std::uint64_t value) {
@@ -135,12 +126,6 @@ struct AggregationMetrics {
         // Merge timestamps
         first_ts = std::min(first_ts, other.first_ts);
         last_ts = std::max(last_ts, other.last_ts);
-
-        // Merge contributing sources
-        contributing_ranks.insert(other.contributing_ranks.begin(),
-                                  other.contributing_ranks.end());
-        contributing_traces.insert(other.contributing_traces.begin(),
-                                   other.contributing_traces.end());
 
         // Merge mean and variance (parallel variance formula)
         if (n > 0) {
