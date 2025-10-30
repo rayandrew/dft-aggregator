@@ -90,15 +90,11 @@ class ChunkAggregatorUtility
         return (timestamp / config.time_interval_us) * config.time_interval_us;
     }
 
-    // Helper: Build aggregation key from yyjson event
+    // Helper: Build aggregation key from JsonValue (reuse json wrapper)
     AggregationKey build_key(
-        yyjson_val* event, const AggregationConfig& config,
+        const JsonValue& json, const AggregationConfig& config,
         const std::shared_ptr<AssociationTracker>& local_tracker) const {
         AggregationKey key;
-
-        // Use JsonParserUtility (stack allocation)
-        JsonParserUtility parser;
-        JsonValue json = parser.process(event);
 
         // Extract core fields
         key.cat = json["cat"].get<std::string_view>();
@@ -115,12 +111,13 @@ class ChunkAggregatorUtility
         key.time_bucket = compute_time_bucket(timestamp, config);
 
         // Extra group keys
-        for (const auto& extra_key : config.extra_group_keys) {
-            std::string field_path = "args." + extra_key;
-            std::string_view value =
-                json.at(field_path).get<std::string_view>();
-            if (!value.empty()) {
-                key.extra_keys[extra_key] = value;
+        if (!config.extra_group_keys.empty()) {
+            JsonValue args = json["args"];
+            for (const auto& extra_key : config.extra_group_keys) {
+                std::string_view value = args[extra_key].get<std::string_view>();
+                if (!value.empty()) {
+                    key.extra_keys[extra_key] = value;
+                }
             }
         }
 
@@ -146,8 +143,7 @@ class ChunkAggregatorUtility
         const std::shared_ptr<AssociationTracker>& local_tracker,
         long long& assoc_time_us, long long& build_key_time_us,
         long long& hash_lookup_time_us, long long& metrics_update_time_us) {
-        JsonParserUtility parser;
-        JsonValue json = parser.process(event);
+        JsonValue json(event);
 
         // Skip metadata events (ph:"M")
         std::string_view ph = json["ph"].get<std::string_view>();
@@ -188,7 +184,7 @@ class ChunkAggregatorUtility
 
         // Build key
         auto build_key_start = std::chrono::high_resolution_clock::now();
-        AggregationKey key = build_key(event, config, local_tracker);
+        AggregationKey key = build_key(json, config, local_tracker);
         auto build_key_end = std::chrono::high_resolution_clock::now();
         build_key_time_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(
