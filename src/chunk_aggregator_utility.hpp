@@ -153,13 +153,17 @@ class ChunkAggregatorUtility
 
         // Extract associations from this event (fork/spawn, boundary events)
         if (local_tracker) {
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
             auto assoc_start = std::chrono::high_resolution_clock::now();
+#endif
             local_tracker->extract_from_event(event, config);
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
             auto assoc_end = std::chrono::high_resolution_clock::now();
             assoc_time_us +=
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     assoc_end - assoc_start)
                     .count();
+#endif
         }
 
         // Filter by category if specified
@@ -187,26 +191,36 @@ class ChunkAggregatorUtility
         JsonValue args = json["args"];
 
         // Build key
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
         auto build_key_start = std::chrono::high_resolution_clock::now();
+#endif
         AggregationKey key =
             build_key(json, args, timestamp, config, local_tracker);
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
         auto build_key_end = std::chrono::high_resolution_clock::now();
         build_key_time_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(
                 build_key_end - build_key_start)
                 .count();
+#endif
 
         // Get or create metrics entry
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
         auto hash_start = std::chrono::high_resolution_clock::now();
+#endif
         auto& metrics = local_aggregations[key];
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
         auto hash_end = std::chrono::high_resolution_clock::now();
         hash_lookup_time_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(hash_end -
                                                                   hash_start)
                 .count();
+#endif
 
         // Extract event data and update metrics
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
         auto metrics_start = std::chrono::high_resolution_clock::now();
+#endif
 
         std::uint64_t duration = json["dur"].get<std::uint64_t>();
         std::uint64_t size = 0;
@@ -255,11 +269,13 @@ class ChunkAggregatorUtility
             }
         }
 
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
         auto metrics_end = std::chrono::high_resolution_clock::now();
         metrics_update_time_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(metrics_end -
                                                                   metrics_start)
                 .count();
+#endif
     }
 
    public:
@@ -271,6 +287,8 @@ class ChunkAggregatorUtility
         ChunkAggregationOutput output;
         output.chunk_index = input.chunk_index;
         output.events_processed = 0;
+        output.bytes_processed = input.end_byte - input.start_byte;
+        output.file_path = input.file_path;  // OK to copy - input is const&
         output.success = false;
 
         // Log progress for every chunk (INFO level for visibility)
@@ -356,10 +374,9 @@ class ChunkAggregatorUtility
         }
 
         std::size_t lines_processed = 0;
-        // constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k
-        // events
 
-        // Timing accumulators for profiling
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
+        // Timing accumulators for profiling (debug only)
         long long total_io_time_us = 0;
         long long total_json_parse_time_us = 0;
         long long total_process_time_us = 0;
@@ -370,16 +387,21 @@ class ChunkAggregatorUtility
         long long total_build_key_time_us = 0;
         long long total_hash_lookup_time_us = 0;
         long long total_metrics_update_time_us = 0;
+#endif
 
         while (!stream->done()) {
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
             auto io_start = std::chrono::high_resolution_clock::now();
+#endif
             std::size_t bytes_read =
                 stream->read(read_buffer_.data(), input.batch_size);
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
             auto io_end = std::chrono::high_resolution_clock::now();
             total_io_time_us +=
                 std::chrono::duration_cast<std::chrono::microseconds>(io_end -
                                                                       io_start)
                     .count();
+#endif
 
             if (bytes_read == 0) break;
 
@@ -387,7 +409,9 @@ class ChunkAggregatorUtility
             std::size_t pos = 0;
 
             while (pos < bytes_read) {
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
                 auto loop_start = std::chrono::high_resolution_clock::now();
+#endif
 
                 // Find next newline
                 const char* line_start = data + pos;
@@ -402,21 +426,26 @@ class ChunkAggregatorUtility
 
                 // Parse JSON line
                 if (line_len > 0) {
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
                     auto parse_start =
                         std::chrono::high_resolution_clock::now();
+#endif
                     yyjson_read_flag flg = YYJSON_READ_NOFLAG;
                     yyjson_doc* doc =
                         yyjson_read_opts(const_cast<char*>(line_start),
                                          line_len, flg, nullptr, nullptr);
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
                     auto parse_end = std::chrono::high_resolution_clock::now();
                     total_json_parse_time_us +=
                         std::chrono::duration_cast<std::chrono::microseconds>(
                             parse_end - parse_start)
                             .count();
+#endif
 
                     if (doc) {
                         yyjson_val* root = yyjson_doc_get_root(doc);
                         if (root && yyjson_is_obj(root)) {
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
                             auto process_start =
                                 std::chrono::high_resolution_clock::now();
                             process_event(root, input.rank, input.file_path,
@@ -432,30 +461,30 @@ class ChunkAggregatorUtility
                                     std::chrono::microseconds>(process_end -
                                                                process_start)
                                     .count();
+#else
+                            // No timing parameters in release mode
+                            long long dummy1 = 0, dummy2 = 0, dummy3 = 0,
+                                      dummy4 = 0;
+                            process_event(root, input.rank, input.file_path,
+                                          input.config, local_aggregations,
+                                          local_tracker, dummy1, dummy2, dummy3,
+                                          dummy4);
+#endif
 
                             output.events_processed++;
                             lines_processed++;
-
-                            // Progress logging
-                            // if (lines_processed % LOG_INTERVAL == 0) {
-                            //     auto thread_id = std::this_thread::get_id();
-                            //     DFTRACER_UTILS_LOG_INFO(
-                            //         "[Thread %zu] Chunk %d: Processed %zu "
-                            //         "events, %zu unique keys",
-                            //         std::hash<std::thread::id>{}(thread_id),
-                            //         input.chunk_index, lines_processed,
-                            //         local_aggregations.size());
-                            // }
                         }
                         yyjson_doc_free(doc);
                     }
                 }
 
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
                 auto loop_end = std::chrono::high_resolution_clock::now();
                 total_loop_overhead_us +=
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         loop_end - loop_start)
                         .count();
+#endif
 
                 pos = (newline - data) + 1;  // Move past newline
             }
@@ -473,36 +502,9 @@ class ChunkAggregatorUtility
                             end_time - start_time)
                             .count();
 
-        auto thread_id = std::this_thread::get_id();
-
-        // Calculate timing breakdown percentages
-        long long total_time_us = duration * 1000;  // ms to us
-        double io_pct = (total_time_us > 0)
-                            ? (total_io_time_us * 100.0 / total_time_us)
-                            : 0;
-        double parse_pct =
-            (total_time_us > 0)
-                ? (total_json_parse_time_us * 100.0 / total_time_us)
-                : 0;
-        double process_pct =
-            (total_time_us > 0)
-                ? (total_process_time_us * 100.0 / total_time_us)
-                : 0;
-        double overhead_pct =
-            (total_time_us > 0)
-                ? (total_loop_overhead_us * 100.0 / total_time_us)
-                : 0;
-
-        // Note: loop_overhead includes parse + process time, so compute "other"
-        double accounted_time_us =
-            total_io_time_us + total_json_parse_time_us + total_process_time_us;
-        double other_pct =
-            (total_time_us > 0)
-                ? ((total_time_us - accounted_time_us) * 100.0 / total_time_us)
-                : 0;
-
         // Log completion for every chunk (INFO level)
         if (input.chunk_index % 100 == 0 || output.events_processed > 0) {
+            auto thread_id = std::this_thread::get_id();
             DFTRACER_UTILS_LOG_INFO(
                 "[Thread %zu] Chunk %d DONE: %zu events → %zu keys in %ld ms "
                 "(%.2f events/sec)",
@@ -510,6 +512,35 @@ class ChunkAggregatorUtility
                 output.events_processed, output.aggregations.size(), duration,
                 duration > 0 ? (output.events_processed * 1000.0 / duration)
                              : 0.0);
+
+#if DFTRACER_UTILS_LOGGER_DEBUG_ENABLED == 1
+            // Calculate timing breakdown percentages (debug only)
+            long long total_time_us = duration * 1000;  // ms to us
+            double io_pct = (total_time_us > 0)
+                                ? (total_io_time_us * 100.0 / total_time_us)
+                                : 0;
+            double parse_pct =
+                (total_time_us > 0)
+                    ? (total_json_parse_time_us * 100.0 / total_time_us)
+                    : 0;
+            double process_pct =
+                (total_time_us > 0)
+                    ? (total_process_time_us * 100.0 / total_time_us)
+                    : 0;
+            double overhead_pct =
+                (total_time_us > 0)
+                    ? (total_loop_overhead_us * 100.0 / total_time_us)
+                    : 0;
+
+            // Note: loop_overhead includes parse + process time, so compute
+            // "other"
+            double accounted_time_us = total_io_time_us +
+                                       total_json_parse_time_us +
+                                       total_process_time_us;
+            double other_pct = (total_time_us > 0)
+                                   ? ((total_time_us - accounted_time_us) *
+                                      100.0 / total_time_us)
+                                   : 0;
 
             // Log timing breakdown
             DFTRACER_UTILS_LOG_INFO(
@@ -547,6 +578,7 @@ class ChunkAggregatorUtility
                 total_build_key_time_us / 1000, hash_pct,
                 total_hash_lookup_time_us / 1000, metrics_pct,
                 total_metrics_update_time_us / 1000);
+#endif
         }
 
         return output;

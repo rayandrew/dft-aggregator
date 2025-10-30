@@ -3,6 +3,8 @@
 #include <dftracer/utils/core/common/logging.h>
 #include <dftracer/utils/core/utilities/utility.h>
 
+#include <unordered_set>
+
 #include "aggregation_output.hpp"
 
 using namespace dftracer::utils;
@@ -32,10 +34,15 @@ class EventAggregatorUtility
 
         EventAggregatorUtilityOutput merged_output;
 
+        // Track unique files
+        std::unordered_set<std::string> unique_files;
+
         for (const auto& output : input.chunk_outputs) {
             if (!output.success) continue;
 
             merged_output.total_events_processed += output.events_processed;
+            merged_output.total_bytes_processed += output.bytes_processed;
+            unique_files.insert(output.file_path);
 
             // Merge aggregation maps
             for (const auto& [key, metrics] : output.aggregations) {
@@ -83,10 +90,15 @@ class EventAggregatorUtility
             }
         }
 
+        // Set unique file count
+        merged_output.total_files_processed = unique_files.size();
+
         DFTRACER_UTILS_LOG_INFO(
-            "Aggregation merge complete: %zu unique keys, %zu total events",
+            "Aggregation merge complete: %zu unique keys, %zu total events, "
+            "%zu files",
             merged_output.aggregations.size(),
-            merged_output.total_events_processed);
+            merged_output.total_events_processed,
+            merged_output.total_files_processed);
 
         merged_output.success = true;
         return merged_output;

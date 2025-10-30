@@ -18,6 +18,8 @@ struct ChunkAggregationOutput {
         aggregations;
     int chunk_index = 0;
     std::size_t events_processed = 0;
+    std::size_t bytes_processed = 0;
+    std::string file_path;
     bool success = false;
     std::shared_ptr<AssociationTracker> local_tracker;
 };
@@ -33,5 +35,6 @@ struct EventAggregatorUtilityOutput {
         aggregations;
     std::size_t total_events_processed = 0;
     std::size_t total_files_processed = 0;
+    std::size_t total_bytes_processed = 0;
     bool success = true;
 };
