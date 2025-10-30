@@ -331,10 +331,9 @@ class ChunkAggregatorUtility
 
                 std::size_t line_len = newline - line_start;
 
-                // Parse JSON line (in-situ for better performance)
+                // Parse JSON line
                 if (line_len > 0) {
-                    yyjson_read_flag flg =
-                        YYJSON_READ_INSITU | YYJSON_READ_NOFLAG;
+                    yyjson_read_flag flg = YYJSON_READ_NOFLAG;
                     yyjson_doc* doc =
                         yyjson_read_opts(const_cast<char*>(line_start),
                                          line_len, flg, nullptr, nullptr);
@@ -351,8 +350,7 @@ class ChunkAggregatorUtility
                             if (lines_processed % LOG_INTERVAL == 0) {
                                 auto thread_id = std::this_thread::get_id();
                                 DFTRACER_UTILS_LOG_INFO(
-                                    "[Thread %zu] Chunk %d: Processed %zu "
-                                    "events, %zu unique keys",
+                                    "[Thread %zu] Chunk %d: Processed %zu events, %zu unique keys",
                                     std::hash<std::thread::id>{}(thread_id),
                                     input.chunk_index, lines_processed,
                                     local_aggregations.size());
