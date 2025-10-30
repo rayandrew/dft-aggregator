@@ -7,6 +7,7 @@
 #include <yyjson.h>
 
 #include <chrono>
+#include <cstring>
 #include <string_view>
 #include <thread>
 
@@ -73,6 +74,10 @@ class ChunkAggregatorUtility
    private:
     // Shared association tracker (read-only after Pass 1 merge)
     const AssociationTracker* association_tracker_;
+
+    // Thread-local reusable buffer for batch reading (4MB)
+    static constexpr std::size_t BATCH_SIZE = 4 * 1024 * 1024;
+    thread_local static std::vector<char> read_buffer_;
 
     // Helper: Compute time bucket
     std::uint64_t compute_time_bucket(std::uint64_t timestamp,
@@ -235,11 +240,12 @@ class ChunkAggregatorUtility
 
         // Log progress for every chunk (INFO level for visibility)
         if (input.chunk_index % 100 == 0) {
-            DFTRACER_UTILS_LOG_INFO("Starting chunk %d/%d: %s [bytes %zu-%zu]",
-                                    input.chunk_index, 9608,
-                                    input.file_path.c_str(), input.start_byte,
-                                    input.end_byte);
+            DFTRACER_UTILS_LOG_INFO("Starting chunk %d: %s [bytes %zu-%zu]",
+                                    input.chunk_index, input.file_path.c_str(),
+                                    input.start_byte, input.end_byte);
         }
+
+        auto reader_start = std::chrono::high_resolution_clock::now();
 
         // Create indexed file reader
         auto reader_input =
@@ -257,9 +263,22 @@ class ChunkAggregatorUtility
             return output;
         }
 
-        // Create stream using LINE_BYTES for byte-range access
+        auto reader_end = std::chrono::high_resolution_clock::now();
+        auto reader_time =
+            std::chrono::duration_cast<std::chrono::milliseconds>(reader_end -
+                                                                  reader_start)
+                .count();
+
+        if (input.chunk_index % 100 == 0) {
+            DFTRACER_UTILS_LOG_INFO("Chunk %d: Reader created in %ld ms",
+                                    input.chunk_index, reader_time);
+        }
+
+        // Create stream using MULTI_LINES_BYTES for batch reading (much
+        // faster!)
+        auto stream_start = std::chrono::high_resolution_clock::now();
         auto stream =
-            reader->stream(StreamType::LINE_BYTES, RangeType::BYTE_RANGE,
+            reader->stream(StreamType::MULTI_LINES_BYTES, RangeType::BYTE_RANGE,
                            input.start_byte, input.end_byte);
 
         if (!stream) {
@@ -267,6 +286,17 @@ class ChunkAggregatorUtility
                                      input.chunk_index,
                                      input.file_path.c_str());
             return output;
+        }
+
+        auto stream_end = std::chrono::high_resolution_clock::now();
+        auto stream_time =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stream_end -
+                                                                  stream_start)
+                .count();
+
+        if (input.chunk_index % 100 == 0) {
+            DFTRACER_UTILS_LOG_INFO("Chunk %d: Stream created in %ld ms",
+                                    input.chunk_index, stream_time);
         }
 
         // Thread-local aggregation map (lock-free!)
@@ -277,42 +307,62 @@ class ChunkAggregatorUtility
         // Reserve space for likely number of keys to reduce rehashing
         local_aggregations.reserve(10000);
 
-        // Process each line (event) - optimized batch processing
-        constexpr std::size_t BUFFER_SIZE = 65536;  // 64KB buffer per line
-        std::vector<char> buffer(BUFFER_SIZE);
         std::size_t lines_processed = 0;
-        std::size_t batch_size = 0;
         constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k events
 
         while (!stream->done()) {
-            std::size_t bytes_read = stream->read(buffer.data(), BUFFER_SIZE);
+            std::size_t bytes_read =
+                stream->read(read_buffer_.data(), BATCH_SIZE);
             if (bytes_read == 0) break;
 
-            // Parse JSON line (in-situ for better performance)
-            yyjson_read_flag flg = YYJSON_READ_INSITU | YYJSON_READ_NOFLAG;
-            yyjson_doc* doc = yyjson_read_opts(buffer.data(), bytes_read, flg,
-                                               nullptr, nullptr);
+            const char* data = read_buffer_.data();
+            std::size_t pos = 0;
 
-            if (doc) {
-                yyjson_val* root = yyjson_doc_get_root(doc);
-                if (root && yyjson_is_obj(root)) {
-                    process_event(root, input.rank, input.file_path,
-                                  input.config, local_aggregations);
-                    output.events_processed++;
-                    lines_processed++;
+            while (pos < bytes_read) {
+                // Find next newline
+                const char* line_start = data + pos;
+                const char* newline = static_cast<const char*>(
+                    memchr(line_start, '\n', bytes_read - pos));
 
-                    // Progress logging
-                    if (lines_processed % LOG_INTERVAL == 0) {
-                        auto thread_id = std::this_thread::get_id();
-                        DFTRACER_UTILS_LOG_INFO(
-                            "[Thread %zu] Chunk %d: Processed %zu events, %zu "
-                            "unique keys",
-                            std::hash<std::thread::id>{}(thread_id),
-                            input.chunk_index, lines_processed,
-                            local_aggregations.size());
+                if (!newline) {
+                    // No more lines in this buffer
+                    break;
+                }
+
+                std::size_t line_len = newline - line_start;
+
+                // Parse JSON line (in-situ for better performance)
+                if (line_len > 0) {
+                    yyjson_read_flag flg =
+                        YYJSON_READ_INSITU | YYJSON_READ_NOFLAG;
+                    yyjson_doc* doc =
+                        yyjson_read_opts(const_cast<char*>(line_start),
+                                         line_len, flg, nullptr, nullptr);
+
+                    if (doc) {
+                        yyjson_val* root = yyjson_doc_get_root(doc);
+                        if (root && yyjson_is_obj(root)) {
+                            process_event(root, input.rank, input.file_path,
+                                          input.config, local_aggregations);
+                            output.events_processed++;
+                            lines_processed++;
+
+                            // Progress logging
+                            if (lines_processed % LOG_INTERVAL == 0) {
+                                auto thread_id = std::this_thread::get_id();
+                                DFTRACER_UTILS_LOG_INFO(
+                                    "[Thread %zu] Chunk %d: Processed %zu "
+                                    "events, %zu unique keys",
+                                    std::hash<std::thread::id>{}(thread_id),
+                                    input.chunk_index, lines_processed,
+                                    local_aggregations.size());
+                            }
+                        }
+                        yyjson_doc_free(doc);
                     }
                 }
-                yyjson_doc_free(doc);
+
+                pos = (newline - data) + 1;  // Move past newline
             }
         }
 
@@ -341,3 +391,7 @@ class ChunkAggregatorUtility
         return output;
     }
 };
+
+// Define thread-local static buffer
+thread_local std::vector<char> ChunkAggregatorUtility::read_buffer_(
+    ChunkAggregatorUtility::BATCH_SIZE);
