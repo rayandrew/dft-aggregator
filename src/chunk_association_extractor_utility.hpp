@@ -8,7 +8,6 @@
 
 #include "association_tracker.hpp"
 #include "chunk_aggregator_utility.hpp"
-#include "trace_parser.hpp"
 
 using namespace dftracer::utils;
 

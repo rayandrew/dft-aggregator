@@ -6,11 +6,12 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "aggregation_config.hpp"
-#include "trace_parser.hpp"
+#include "json_parser_utility.hpp"
 
 // Represents a time interval for a boundary event (e.g., epoch)
 struct BoundaryInterval {
@@ -41,13 +42,17 @@ class AssociationTracker {
                             const AggregationConfig& config) {
         if (!event || !yyjson_is_obj(event)) return;
 
-        std::string name = TraceParser::get_string(event, "name");
-        std::uint64_t pid = TraceParser::get_uint64(event, "pid");
+        // Use JsonParserUtility (stack allocation for consistency)
+        JsonParserUtility parser;
+        auto json = parser.process(event);
+
+        std::string_view name = json["name"].get<std::string_view>();
+        std::uint64_t pid = json["pid"].get<std::uint64_t>();
 
         // Track fork/spawn events
         if (config.track_process_parents &&
             (name == "fork" || name == "spawn")) {
-            std::uint64_t child_pid = TraceParser::get_arg_uint64(event, "ret");
+            std::uint64_t child_pid = json["args"]["ret"].get<std::uint64_t>();
             if (child_pid > 0) {
                 process_parents_[child_pid] = pid;
             }
@@ -56,11 +61,12 @@ class AssociationTracker {
         // Track boundary events
         for (const auto& boundary_config : config.boundary_events) {
             if (name == boundary_config.event_name) {
-                std::string value = TraceParser::get_arg_string(
-                    event, boundary_config.value_field.c_str());
+                std::string field_path = "args." + boundary_config.value_field;
+                std::string_view value =
+                    json.at(field_path).get<std::string_view>();
                 if (!value.empty()) {
-                    std::uint64_t ts = TraceParser::get_uint64(event, "ts");
-                    std::uint64_t dur = TraceParser::get_uint64(event, "dur");
+                    std::uint64_t ts = json["ts"].get<std::uint64_t>();
+                    std::uint64_t dur = json["dur"].get<std::uint64_t>();
 
                     BoundaryInterval interval;
                     interval.name = boundary_config.output_name;
@@ -98,7 +104,11 @@ class AssociationTracker {
         // First, check if this process has local boundary events
         auto it = process_intervals_.find(pid);
         if (it != process_intervals_.end()) {
+            // Intervals are sorted by start_ts, so we can use early termination
             for (const auto& interval : it->second) {
+                // Early exit if we've passed the timestamp (sorted by start_ts)
+                if (ts < interval.start_ts) break;
+
                 if (ts >= interval.start_ts && ts < interval.end_ts) {
                     result[interval.name] = interval.value;
                 }

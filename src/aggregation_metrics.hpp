@@ -3,10 +3,9 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
-#include <map>
-#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 struct AggregationMetrics {
     // Event count
@@ -31,8 +30,8 @@ struct AggregationMetrics {
     std::uint64_t last_ts = 0;
 
     // Contributing sources
-    std::set<int> contributing_ranks;
-    std::set<std::string> contributing_traces;
+    std::unordered_set<int> contributing_ranks;
+    std::unordered_set<std::string> contributing_traces;
 
     // Association data
     std::unordered_map<std::string, std::string>

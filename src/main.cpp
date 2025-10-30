@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "aggregation_config.hpp"
+#include "association_merger_utility.hpp"
 #include "chunk_aggregator_utility.hpp"
 #include "chunk_association_extractor_utility.hpp"
 #include "chunk_mapper_utility.hpp"
@@ -412,29 +413,14 @@ int main(int argc, char** argv) {
     // ========================================================================
     DFTRACER_UTILS_LOG_INFO("%s", "Task 5: Configuring association merge...");
 
+    auto association_merger = std::make_shared<AssociationMergerUtility>();
     auto merge_associations_func =
-        [](const std::vector<ChunkAssociationOutput>& chunk_outputs)
-        -> AssociationTracker {
-        DFTRACER_UTILS_LOG_INFO("Merging %zu association trackers...",
-                                chunk_outputs.size());
-
-        AssociationTracker merged;
-        std::size_t total_events = 0;
-
-        for (const auto& output : chunk_outputs) {
-            if (output.success) {
-                merged.merge(output.tracker);
-                total_events += output.events_processed;
-            }
-        }
-
-        DFTRACER_UTILS_LOG_INFO(
-            "Association merge complete: %zu events processed. "
-            "Process tree: %s, Boundary events: %s",
-            total_events, merged.has_process_tree() ? "yes" : "no",
-            merged.has_boundary_events() ? "yes" : "no");
-
-        return merged;
+        [association_merger](
+            const std::vector<ChunkAssociationOutput>& chunk_outputs)
+        -> AssociationMergerUtilityOutput {
+        AssociationMergerUtilityInput input;
+        input.chunk_outputs = chunk_outputs;
+        return association_merger->process(input);
     };
 
     auto task5_merge_associations =
@@ -451,11 +437,11 @@ int main(int argc, char** argv) {
 
     // Task 5b: Store the merged tracker for use by Task 6
     auto store_tracker_func =
-        [shared_tracker](
-            const AssociationTracker& merged_tracker) -> AssociationTracker {
-        *shared_tracker = merged_tracker;
+        [shared_tracker](const AssociationMergerUtilityOutput& merger_output)
+        -> AssociationMergerUtilityOutput {
+        *shared_tracker = merger_output.merged_tracker;
         DFTRACER_UTILS_LOG_INFO("Stored merged association tracker");
-        return merged_tracker;
+        return merger_output;
     };
     auto task5b_store_tracker = make_task(store_tracker_func, "StoreTracker");
 
@@ -485,7 +471,7 @@ int main(int argc, char** argv) {
     // Combiner that sets the tracker and provides chunks
     task6_aggregate_chunks->with_combiner(
         [shared_tracker, shared_chunks,
-         aggregator_workflow](const AssociationTracker&) {
+         aggregator_workflow](const AssociationMergerUtilityOutput&) {
             // Set tracker on the aggregator before processing
             aggregator_workflow->set_association_tracker(shared_tracker.get());
             DFTRACER_UTILS_LOG_INFO(

@@ -6,9 +6,11 @@
 #include <dftracer/utils/utilities/composites/indexed_file_reader.h>
 #include <yyjson.h>
 
+#include <string_view>
+
 #include "aggregation_output.hpp"
 #include "association_tracker.hpp"
-#include "trace_parser.hpp"
+#include "json_parser_utility.hpp"
 
 using namespace dftracer::utils;
 
@@ -84,24 +86,29 @@ class ChunkAggregatorUtility
                              const AggregationConfig& config) const {
         AggregationKey key;
 
+        // Use JsonParserUtility (stack allocation)
+        JsonParserUtility parser;
+        JsonValue json = parser.process(event);
+
         // Extract core fields
-        key.cat = TraceParser::get_string(event, "cat");
-        key.name = TraceParser::get_string(event, "name");
-        key.pid = TraceParser::get_uint64(event, "pid");
-        key.tid = TraceParser::get_uint64(event, "tid");
+        key.cat = json["cat"].get<std::string_view>();
+        key.name = json["name"].get<std::string_view>();
+        key.pid = json["pid"].get<std::uint64_t>();
+        key.tid = json["tid"].get<std::uint64_t>();
 
         // Extract from args
-        key.hhash = TraceParser::get_arg_string(event, "hhash");
-        key.fhash = TraceParser::get_arg_string(event, "fhash");
+        key.hhash = json["args"]["hhash"].get<std::string_view>();
+        key.fhash = json["args"]["fhash"].get<std::string_view>();
 
         // Time bucket
-        std::uint64_t timestamp = TraceParser::get_uint64(event, "ts");
+        std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
         key.time_bucket = compute_time_bucket(timestamp, config);
 
         // Extra group keys
         for (const auto& extra_key : config.extra_group_keys) {
-            std::string value =
-                TraceParser::get_arg_string(event, extra_key.c_str());
+            std::string field_path = "args." + extra_key;
+            std::string_view value =
+                json.at(field_path).get<std::string_view>();
             if (!value.empty()) {
                 key.extra_keys[extra_key] = value;
             }
@@ -126,15 +133,18 @@ class ChunkAggregatorUtility
         const AggregationConfig& config,
         std::unordered_map<AggregationKey, AggregationMetrics,
                            AggregationKeyHash>& local_aggregations) {
-        // Skip metadata events (ph:"M") - they should not be aggregated
-        std::string ph = TraceParser::get_string(event, "ph");
+        JsonParserUtility parser;
+        JsonValue json = parser.process(event);
+
+        // Skip metadata events (ph:"M")
+        std::string_view ph = json["ph"].get<std::string_view>();
         if (ph == "M") {
             return;
         }
 
         // Filter by category if specified
         if (!config.include_categories.empty()) {
-            std::string cat = TraceParser::get_string(event, "cat");
+            std::string_view cat = json["cat"].get<std::string_view>();
             if (std::find(config.include_categories.begin(),
                           config.include_categories.end(),
                           cat) == config.include_categories.end()) {
@@ -144,7 +154,7 @@ class ChunkAggregatorUtility
 
         // Filter by name if specified
         if (!config.include_names.empty()) {
-            std::string name = TraceParser::get_string(event, "name");
+            std::string_view name = json["name"].get<std::string_view>();
             if (std::find(config.include_names.begin(),
                           config.include_names.end(),
                           name) == config.include_names.end()) {
@@ -159,8 +169,8 @@ class ChunkAggregatorUtility
         auto& metrics = local_aggregations[key];
 
         // Extract event data
-        std::uint64_t duration = TraceParser::get_uint64(event, "dur");
-        std::uint64_t timestamp = TraceParser::get_uint64(event, "ts");
+        std::uint64_t duration = json["dur"].get<std::uint64_t>();
+        std::uint64_t timestamp = json["ts"].get<std::uint64_t>();
         std::uint64_t size = 0;
 
         // Update metrics
@@ -168,16 +178,16 @@ class ChunkAggregatorUtility
         metrics.update_timestamp(timestamp);
 
         // Handle size (from args.ret)
-        if (TraceParser::has_arg(event, "ret")) {
-            size = TraceParser::get_arg_uint64(event, "ret");
+        if (json["args"]["ret"].exists()) {
+            size = json["args"]["ret"].get<std::uint64_t>();
             metrics.update_size(size);
         }
 
         // Handle custom metrics
         for (const auto& field : config.custom_metric_fields) {
-            if (TraceParser::has_arg(event, field.c_str())) {
-                std::uint64_t value =
-                    TraceParser::get_arg_uint64(event, field.c_str());
+            std::string field_path = "args." + field;
+            if (json.at(field_path).exists()) {
+                std::uint64_t value = json.at(field_path).get<std::uint64_t>();
                 metrics.update_custom_metric(field, value);
             }
         }
@@ -189,8 +199,8 @@ class ChunkAggregatorUtility
 
         // Add association data if first time seeing this key
         if (metrics.count == 1) {
-            std::uint64_t pid = TraceParser::get_uint64(event, "pid");
-            std::uint64_t ts = TraceParser::get_uint64(event, "ts");
+            std::uint64_t pid = json["pid"].get<std::uint64_t>();
+            std::uint64_t ts = json["ts"].get<std::uint64_t>();
 
             // Get boundary associations (epoch, step, etc.)
             if (association_tracker_ && !config.boundary_events.empty()) {

@@ -58,3 +58,8 @@ target_link_libraries(dftracer_aggregator PUBLIC dftracer_utils::shared  argpars
 
 # Include directories
 target_include_directories(dftracer_aggregator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Test executable for JSON parser
+add_executable(test_json_parser test_json_parser.cpp)
+target_link_libraries(test_json_parser PUBLIC dftracer_utils::shared)
+target_include_directories(test_json_parser PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
