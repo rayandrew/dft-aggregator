@@ -325,17 +325,32 @@ class ChunkAggregatorUtility
         }
 
         std::size_t lines_processed = 0;
-        constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k events
+        // constexpr std::size_t LOG_INTERVAL = 100000;  // Log every 100k events
+
+        // Timing accumulators for profiling
+        long long total_io_time_us = 0;
+        long long total_json_parse_time_us = 0;
+        long long total_process_time_us = 0;
+        long long total_loop_overhead_us = 0;
 
         while (!stream->done()) {
+            auto io_start = std::chrono::high_resolution_clock::now();
             std::size_t bytes_read =
                 stream->read(read_buffer_.data(), input.batch_size);
+            auto io_end = std::chrono::high_resolution_clock::now();
+            total_io_time_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(io_end -
+                                                                      io_start)
+                    .count();
+
             if (bytes_read == 0) break;
 
             const char* data = read_buffer_.data();
             std::size_t pos = 0;
 
             while (pos < bytes_read) {
+                auto loop_start = std::chrono::high_resolution_clock::now();
+
                 // Find next newline
                 const char* line_start = data + pos;
                 const char* newline = static_cast<const char*>(
@@ -349,34 +364,56 @@ class ChunkAggregatorUtility
 
                 // Parse JSON line
                 if (line_len > 0) {
+                    auto parse_start = std::chrono::high_resolution_clock::now();
                     yyjson_read_flag flg = YYJSON_READ_NOFLAG;
                     yyjson_doc* doc =
                         yyjson_read_opts(const_cast<char*>(line_start),
                                          line_len, flg, nullptr, nullptr);
+                    auto parse_end = std::chrono::high_resolution_clock::now();
+                    total_json_parse_time_us +=
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            parse_end - parse_start)
+                            .count();
 
                     if (doc) {
                         yyjson_val* root = yyjson_doc_get_root(doc);
                         if (root && yyjson_is_obj(root)) {
+                            auto process_start =
+                                std::chrono::high_resolution_clock::now();
                             process_event(root, input.rank, input.file_path,
                                           input.config, local_aggregations,
                                           local_tracker);
+                            auto process_end =
+                                std::chrono::high_resolution_clock::now();
+                            total_process_time_us +=
+                                std::chrono::duration_cast<
+                                    std::chrono::microseconds>(process_end -
+                                                               process_start)
+                                    .count();
+
                             output.events_processed++;
                             lines_processed++;
 
                             // Progress logging
-                            if (lines_processed % LOG_INTERVAL == 0) {
-                                auto thread_id = std::this_thread::get_id();
-                                DFTRACER_UTILS_LOG_INFO(
-                                    "[Thread %zu] Chunk %d: Processed %zu "
-                                    "events, %zu unique keys",
-                                    std::hash<std::thread::id>{}(thread_id),
-                                    input.chunk_index, lines_processed,
-                                    local_aggregations.size());
-                            }
+                            // if (lines_processed % LOG_INTERVAL == 0) {
+                            //     auto thread_id = std::this_thread::get_id();
+                            //     DFTRACER_UTILS_LOG_INFO(
+                            //         "[Thread %zu] Chunk %d: Processed %zu "
+                            //         "events, %zu unique keys",
+                            //         std::hash<std::thread::id>{}(thread_id),
+                            //         input.chunk_index, lines_processed,
+                            //         local_aggregations.size());
+                            // }
                         }
                         yyjson_doc_free(doc);
                     }
                 }
+
+                auto loop_end = std::chrono::high_resolution_clock::now();
+                total_loop_overhead_us +=
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        loop_end - loop_start)
+                        .count();
 
                 pos = (newline - data) + 1;  // Move past newline
             }
@@ -396,6 +433,30 @@ class ChunkAggregatorUtility
 
         auto thread_id = std::this_thread::get_id();
 
+        // Calculate timing breakdown percentages
+        long long total_time_us = duration * 1000;  // ms to us
+        double io_pct =
+            (total_time_us > 0) ? (total_io_time_us * 100.0 / total_time_us) : 0;
+        double parse_pct = (total_time_us > 0)
+                               ? (total_json_parse_time_us * 100.0 / total_time_us)
+                               : 0;
+        double process_pct =
+            (total_time_us > 0)
+                ? (total_process_time_us * 100.0 / total_time_us)
+                : 0;
+        double overhead_pct =
+            (total_time_us > 0)
+                ? (total_loop_overhead_us * 100.0 / total_time_us)
+                : 0;
+
+        // Note: loop_overhead includes parse + process time, so compute "other"
+        double accounted_time_us =
+            total_io_time_us + total_json_parse_time_us + total_process_time_us;
+        double other_pct = (total_time_us > 0)
+                               ? ((total_time_us - accounted_time_us) * 100.0 /
+                                  total_time_us)
+                               : 0;
+
         // Log completion for every chunk (INFO level)
         if (input.chunk_index % 100 == 0 || output.events_processed > 0) {
             DFTRACER_UTILS_LOG_INFO(
@@ -405,6 +466,15 @@ class ChunkAggregatorUtility
                 output.events_processed, output.aggregations.size(), duration,
                 duration > 0 ? (output.events_processed * 1000.0 / duration)
                              : 0.0);
+
+            // Log timing breakdown
+            DFTRACER_UTILS_LOG_INFO(
+                "[Thread %zu] Chunk %d TIMING: I/O=%.1f%% (%lld ms), "
+                "JSON=%.1f%% (%lld ms), Process=%.1f%% (%lld ms), Other=%.1f%%",
+                std::hash<std::thread::id>{}(thread_id), input.chunk_index,
+                io_pct, total_io_time_us / 1000, parse_pct,
+                total_json_parse_time_us / 1000, process_pct,
+                total_process_time_us / 1000, other_pct);
         }
 
         return output;
