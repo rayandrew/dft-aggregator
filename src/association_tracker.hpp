@@ -126,4 +126,40 @@ class AssociationTracker {
 
     // Check if we have any process relationships
     bool has_process_tree() const { return !process_parents_.empty(); }
+
+    // Merge another tracker into this one (for parallel processing)
+    void merge(const AssociationTracker& other) {
+        // Merge process parents (child -> parent mapping)
+        for (const auto& [child_pid, parent_pid] : other.process_parents_) {
+            process_parents_[child_pid] = parent_pid;
+        }
+
+        // Merge process intervals (pid -> intervals)
+        for (const auto& [pid, intervals] : other.process_intervals_) {
+            auto& my_intervals = process_intervals_[pid];
+            my_intervals.insert(my_intervals.end(), intervals.begin(),
+                                intervals.end());
+        }
+
+        // Merge all_intervals_ (will need re-sorting after merge)
+        all_intervals_.insert(all_intervals_.end(),
+                              other.all_intervals_.begin(),
+                              other.all_intervals_.end());
+
+        // Re-sort all intervals by start time after merge
+        if (!all_intervals_.empty()) {
+            std::sort(all_intervals_.begin(), all_intervals_.end(),
+                      [](const BoundaryInterval& a, const BoundaryInterval& b) {
+                          return a.start_ts < b.start_ts;
+                      });
+        }
+
+        // Also need to re-sort per-process intervals
+        for (auto& [pid, intervals] : process_intervals_) {
+            std::sort(intervals.begin(), intervals.end(),
+                      [](const BoundaryInterval& a, const BoundaryInterval& b) {
+                          return a.start_ts < b.start_ts;
+                      });
+        }
+    }
 };
