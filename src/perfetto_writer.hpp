@@ -222,6 +222,13 @@ class PerfettoCounterWriter {
                 buffer += "}";
             }
 
+            // Timestamp range as array [first, last]
+            buffer += ",\"ts_range\":[";
+            std::snprintf(temp, sizeof(temp), "%llu,%llu", metrics.first_ts,
+                          metrics.last_ts);
+            buffer += temp;
+            buffer += "]";
+
             // Add boundary associations (epoch, step, etc.)
             for (const auto& [assoc_name, assoc_value] :
                  metrics.boundary_associations) {
