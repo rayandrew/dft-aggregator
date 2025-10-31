@@ -1,9 +1,9 @@
 #pragma once
 
 #include <dftracer/utils/core/utilities/utility.h>
-#include <dftracer/utils/reader/reader.h>
-#include <dftracer/utils/utilities/composites/composite_types.h>
-#include <dftracer/utils/utilities/composites/indexed_file_reader.h>
+#include <dftracer/utils/utilities/composites/indexed_file_reader_utility.h>
+#include <dftracer/utils/utilities/composites/types.h>
+#include <dftracer/utils/utilities/reader/internal/stream_config.h>
 #include <yyjson.h>
 
 #include <chrono>
@@ -308,9 +308,13 @@ class ChunkAggregatorUtility
         // Create stream using MULTI_LINES_BYTES for batch reading (much
         // faster!)
         auto stream_start = std::chrono::high_resolution_clock::now();
-        auto stream =
-            reader->stream(StreamType::MULTI_LINES_BYTES, RangeType::BYTE_RANGE,
-                           input.start_byte, input.end_byte);
+        auto stream = reader->stream(
+            utilities::reader::internal::StreamConfig()
+                .stream_type(
+                    utilities::reader::internal::StreamType::MULTI_LINES_BYTES)
+                .range_type(utilities::reader::internal::RangeType::BYTE_RANGE)
+                .from(input.start_byte)
+                .to(input.end_byte));
 
         if (!stream) {
             DFTRACER_UTILS_LOG_ERROR("Chunk %d: Failed to create stream for %s",

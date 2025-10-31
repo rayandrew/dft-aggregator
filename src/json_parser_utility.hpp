@@ -1,8 +1,8 @@
 #pragma once
 
 #include <dftracer/utils/core/utilities/utility.h>
-#include <dftracer/utils/utilities/filesystem/directory_scanner.h>
-#include <dftracer/utils/utilities/io/file_reader.h>
+#include <dftracer/utils/utilities/filesystem/directory_scanner_utility.h>
+#include <dftracer/utils/utilities/io/file_reader_utility.h>
 #include <yyjson.h>
 
 #include <cstdint>

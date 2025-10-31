@@ -6,7 +6,7 @@ function(need_dftracer_utils)
     CPMAddPackage(
       NAME dftracer_utils
       GITHUB_REPOSITORY rayandrew/dftracer-utils
-      GIT_TAG 208c30c812d44efd95c382008b27f0647916e93e
+      GIT_TAG b5d49067a4fdcb46948ed5ee775ba3c100391c19
       OPTIONS
         "DFTRACER_UTILS_BUILD_TESTS OFF"
         "DFTRACER_UTILS_BUILD_SHARED ON"

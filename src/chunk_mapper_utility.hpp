@@ -1,7 +1,7 @@
 #pragma once
 
 #include <dftracer/utils/core/utilities/utility.h>
-#include <dftracer/utils/utilities/composites/dft/metadata_collector.h>
+#include <dftracer/utils/utilities/composites/dft/metadata_collector_utility.h>
 
 #include <cstdint>
 #include <string>

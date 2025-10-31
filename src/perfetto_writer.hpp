@@ -1,8 +1,8 @@
 #pragma once
 
 #include <dftracer/utils/core/common/logging.h>
-#include <dftracer/utils/utilities/compression/zlib/streaming_compressor.h>
-#include <dftracer/utils/utilities/io/streaming_file_writer.h>
+#include <dftracer/utils/utilities/compression/zlib/streaming_compressor_utility.h>
+#include <dftracer/utils/utilities/io/streaming_file_writer_utility.h>
 
 #include <algorithm>
 #include <cstdio>
