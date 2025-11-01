@@ -68,10 +68,8 @@ class EventAggregatorUtility
                     std::max(merged_metrics.max_size, metrics.max_size);
 
                 // Update timestamp range
-                merged_metrics.first_ts =
-                    std::min(merged_metrics.first_ts, metrics.first_ts);
-                merged_metrics.last_ts =
-                    std::max(merged_metrics.last_ts, metrics.last_ts);
+                merged_metrics.ts = std::min(merged_metrics.ts, metrics.ts);
+                merged_metrics.te = std::max(merged_metrics.te, metrics.te);
 
                 // For mean, recompute after merge using total/count
                 std::uint64_t new_count = merged_metrics.count;

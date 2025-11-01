@@ -25,9 +25,10 @@ struct AggregationMetrics {
     double mean_size = 0.0;
     double m2_size = 0.0;
 
-    // Timestamp range
-    std::uint64_t first_ts = std::numeric_limits<std::uint64_t>::max();
-    std::uint64_t last_ts = 0;
+    // Timestamp range (for wall-clock calculation)
+    std::uint64_t ts =
+        std::numeric_limits<std::uint64_t>::max();  // First event start time
+    std::uint64_t te = 0;  // Last event end time (max of all ts + dur)
 
     // Association data
     std::unordered_map<std::string, std::string>
@@ -68,9 +69,13 @@ struct AggregationMetrics {
         m2_size += delta * delta2;
     }
 
-    void update_timestamp(std::uint64_t ts) {
-        if (ts < first_ts) first_ts = ts;
-        if (ts > last_ts) last_ts = ts;
+    void update_timestamp(std::uint64_t event_ts, std::uint64_t dur) {
+        // Track first event start
+        if (event_ts < ts) ts = event_ts;
+
+        // Track last event end (exact wall-clock calculation)
+        std::uint64_t event_te = event_ts + dur;
+        if (event_te > te) te = event_te;
     }
 
     void update_custom_metric(const std::string& name, std::uint64_t value) {
@@ -124,8 +129,8 @@ struct AggregationMetrics {
         max_size = std::max(max_size, other.max_size);
 
         // Merge timestamps
-        first_ts = std::min(first_ts, other.first_ts);
-        last_ts = std::max(last_ts, other.last_ts);
+        ts = std::min(ts, other.ts);
+        te = std::max(te, other.te);
 
         // Merge mean and variance (parallel variance formula)
         if (n > 0) {

@@ -227,7 +227,7 @@ class ChunkAggregatorUtility
 
         // Update metrics
         metrics.update_duration(duration);
-        metrics.update_timestamp(timestamp);
+        metrics.update_timestamp(timestamp, duration);
 
         // Handle size (from args.ret) - reuse args
         JsonValue ret = args["ret"];

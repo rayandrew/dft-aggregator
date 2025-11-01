@@ -112,11 +112,16 @@ def compute_wall_clock_time(traces, category, name):
     This measures the actual elapsed time from first event start to last event end,
     accounting for overlapping parallel operations.
 
+    For worker events (with parent_pid), groups by parent to associate workers with
+    their main process. For main process events, groups by PID.
+    This prevents cross-epoch bleeding that can occur when aggregating globally.
+
     Returns:
         dict: {epoch: elapsed_seconds}
     """
-    # Track min start and max end for each epoch
-    epoch_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
+    # Track min start and max end for each (epoch, grouping_pid) pair
+    # grouping_pid = parent_pid for worker events, pid for main process events
+    epoch_pid_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
 
     for event in traces:
         if event.get('ph') != 'C':
@@ -131,26 +136,32 @@ def compute_wall_clock_time(traces, category, name):
 
         args = event.get('args', {})
 
-        # Get timestamp range and duration from this bucket
-        ts_range = args.get('ts_range', [])
-        dur = args.get('dur', {})
+        # Get grouping PID: use parent_pid if available (worker events), otherwise use pid (main process)
+        parent_pid = args.get('parent_pid')
+        pid = event.get('pid')
+        grouping_pid = parent_pid if parent_pid else pid
 
-        if len(ts_range) >= 2 and 'max' in dur:
-            first_ts = ts_range[0]
-            last_ts = ts_range[1]
-            max_dur = dur['max']
+        if grouping_pid is None:
+            continue
 
-            # Track global min/max across all buckets
-            epoch_ranges[epoch]['min_ts'] = min(epoch_ranges[epoch]['min_ts'], first_ts)
-            epoch_ranges[epoch]['max_te'] = max(epoch_ranges[epoch]['max_te'], last_ts + max_dur)
+        # Get timestamp range (ts = start, te = end)
+        ts = args.get('ts')
+        te = args.get('te')
 
-    # Convert ranges to durations
-    epoch_times = {}
-    for epoch, range_data in epoch_ranges.items():
+        if ts is not None and te is not None:
+            # Track min/max per (epoch, grouping_pid)
+            key = (epoch, grouping_pid)
+            epoch_pid_ranges[key]['min_ts'] = min(epoch_pid_ranges[key]['min_ts'], ts)
+            epoch_pid_ranges[key]['max_te'] = max(epoch_pid_ranges[key]['max_te'], te)
+
+    # Compute per-rank wall-clock time, then sum across ranks per epoch
+    epoch_times = defaultdict(float)
+    for (epoch, grouping_pid), range_data in epoch_pid_ranges.items():
         duration_us = range_data['max_te'] - range_data['min_ts']
-        epoch_times[epoch] = duration_us / 1_000_000  # Convert to seconds
+        duration_s = duration_us / 1_000_000
+        epoch_times[epoch] += duration_s
 
-    return epoch_times
+    return dict(epoch_times)
 
 
 def count_workers(traces):
@@ -249,11 +260,14 @@ def compute_effective_io_bandwidth(traces):
     This measures actual throughput and cannot exceed physical LFS bandwidth limits.
     Use this to validate against peak cluster LFS bandwidth.
 
+    Groups by parent_pid (main process) since POSIX events come from worker processes.
+
     Returns:
         dict: {epoch: effective_bandwidth_mbps}
     """
-    epoch_sizes = defaultdict(float)
-    epoch_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
+    # Track per (epoch, grouping_pid)
+    epoch_pid_sizes = defaultdict(float)
+    epoch_pid_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
 
     for event in traces:
         if event.get('ph') != 'C':
@@ -268,37 +282,40 @@ def compute_effective_io_bandwidth(traces):
 
         args = event.get('args', {})
 
-        # Accumulate size
+        # Get grouping PID: use parent_pid for POSIX events (from workers)
+        parent_pid = args.get('parent_pid')
+        pid = event.get('pid')
+        grouping_pid = parent_pid if parent_pid else pid
+
+        if grouping_pid is None:
+            continue
+
+        # Accumulate size per (epoch, grouping_pid)
         size_info = args.get('size', {})
         total_size = size_info.get('total', 0)
-        epoch_sizes[epoch] += total_size
+        key = (epoch, grouping_pid)
+        epoch_pid_sizes[key] += total_size
 
         # Track timestamp range for wall-clock calculation
-        ts_range = args.get('ts_range', [])
-        dur = args.get('dur', {})
+        ts = args.get('ts')
+        te = args.get('te')
 
-        if len(ts_range) >= 2 and 'max' in dur:
-            first_ts = ts_range[0]
-            last_ts = ts_range[1]
-            max_dur = dur['max']
+        if ts is not None and te is not None:
+            epoch_pid_ranges[key]['min_ts'] = min(epoch_pid_ranges[key]['min_ts'], ts)
+            epoch_pid_ranges[key]['max_te'] = max(epoch_pid_ranges[key]['max_te'], te)
 
-            epoch_ranges[epoch]['min_ts'] = min(epoch_ranges[epoch]['min_ts'], first_ts)
-            epoch_ranges[epoch]['max_te'] = max(epoch_ranges[epoch]['max_te'], last_ts + max_dur)
-
-    # Calculate effective bandwidth (MB/s)
-    epoch_bandwidths = {}
-    for epoch in epoch_sizes:
-        if epoch in epoch_ranges:
-            elapsed_us = epoch_ranges[epoch]['max_te'] - epoch_ranges[epoch]['min_ts']
+    # Calculate per-parent bandwidth, then sum across parent processes
+    epoch_bandwidths = defaultdict(float)
+    for (epoch, grouping_pid), size in epoch_pid_sizes.items():
+        key = (epoch, grouping_pid)
+        if key in epoch_pid_ranges:
+            elapsed_us = epoch_pid_ranges[key]['max_te'] - epoch_pid_ranges[key]['min_ts']
             elapsed_sec = elapsed_us / 1_000_000
 
             if elapsed_sec > 0:
-                size_mb = epoch_sizes[epoch] / (1024 * 1024)
-                epoch_bandwidths[epoch] = size_mb / elapsed_sec
-            else:
-                epoch_bandwidths[epoch] = 0.0
-        else:
-            epoch_bandwidths[epoch] = 0.0
+                size_mb = size / (1024 * 1024)
+                bandwidth = size_mb / elapsed_sec
+                epoch_bandwidths[epoch] += bandwidth
 
     return dict(epoch_bandwidths)
 
@@ -393,8 +410,17 @@ def print_summary_table(metrics):
 
 def main():
     """Main analysis pipeline."""
+    import sys
+
+    # Get input file from command line argument or use default
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+    else:
+        input_file = 'aggregated.pfw.gz'
+
     print("\n=== Loading Aggregated Traces ===")
-    traces, metadata = load_aggregated_traces('aggregated.pfw.gz')
+    print(f"Input file: {input_file}")
+    traces, metadata = load_aggregated_traces(input_file)
     print(f"Loaded {len(traces)} trace events")
 
     # Extract metadata

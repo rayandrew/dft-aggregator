@@ -62,10 +62,10 @@ def load_raw_traces(traces_dir):
 
 def extract_epoch_boundaries(events):
     """
-    Extract epoch boundaries from epoch.block events.
+    Extract per-rank epoch boundaries from epoch.block events.
 
     Returns:
-        dict: {epoch: (min_ts, max_ts)} for each epoch
+        dict: {(epoch, pid): (min_ts, max_ts)} for each (epoch, pid) pair
     """
     epoch_boundaries = {}
 
@@ -84,35 +84,76 @@ def extract_epoch_boundaries(events):
         except (ValueError, TypeError):
             continue
 
+        pid = event.get('pid')
+        if pid is None:
+            continue
+
         ts = event.get('ts', 0)
         dur = event.get('dur', 0)
         te = ts + dur
 
-        if epoch not in epoch_boundaries:
-            epoch_boundaries[epoch] = (ts, te)
+        key = (epoch, pid)
+        if key not in epoch_boundaries:
+            epoch_boundaries[key] = (ts, te)
         else:
             # Extend boundary to include this event
-            min_ts, max_te = epoch_boundaries[epoch]
-            epoch_boundaries[epoch] = (min(min_ts, ts), max(max_te, te))
+            min_ts, max_te = epoch_boundaries[key]
+            epoch_boundaries[key] = (min(min_ts, ts), max(max_te, te))
 
     return epoch_boundaries
 
 
-def get_epoch_for_timestamp(ts, epoch_boundaries):
+def get_epoch_for_event(event, epoch_boundaries, process_tree):
     """
-    Determine which epoch a timestamp belongs to.
+    Determine which epoch an event belongs to using per-rank boundaries.
 
     Args:
-        ts: Timestamp to check
-        epoch_boundaries: dict from extract_epoch_boundaries()
+        event: Event to check
+        epoch_boundaries: dict from extract_epoch_boundaries() - {(epoch, pid): (min_ts, max_ts)}
+        process_tree: dict mapping child_pid -> parent_pid
 
     Returns:
-        int or None: Epoch number if timestamp falls within boundaries
+        int or None: Epoch number if event falls within a rank's epoch boundaries
     """
-    for epoch, (min_ts, max_ts) in epoch_boundaries.items():
-        if min_ts <= ts <= max_ts:
+    ts = event.get('ts', 0)
+    pid = event.get('pid')
+
+    if pid is None:
+        return None
+
+    # Determine which rank's boundaries to check
+    # For worker processes, use parent's boundaries
+    grouping_pid = process_tree.get(pid, pid)
+
+    # Check all epochs for this rank
+    for (epoch, boundary_pid), (min_ts, max_ts) in epoch_boundaries.items():
+        if boundary_pid == grouping_pid and min_ts <= ts <= max_ts:
             return epoch
+
     return None
+
+
+def build_process_tree(events):
+    """
+    Build process tree from fork/spawn events.
+
+    Returns:
+        dict: child_pid -> parent_pid mapping
+    """
+    process_tree = {}
+
+    for event in events:
+        if event.get('name') not in ['fork', 'spawn']:
+            continue
+
+        args = event.get('args', {})
+        child_pid = args.get('ret')
+        parent_pid = event.get('pid')
+
+        if child_pid and parent_pid:
+            process_tree[child_pid] = parent_pid
+
+    return process_tree
 
 
 def compute_trace_duration_raw(events):
@@ -148,24 +189,36 @@ def compute_trace_duration_raw(events):
 
 def compute_epoch_durations_raw(epoch_boundaries):
     """
-    Compute per-epoch durations from boundaries.
+    Compute per-epoch durations from per-rank boundaries.
+
+    Combines all ranks' epoch boundaries to get the overall epoch duration.
 
     Args:
-        epoch_boundaries: dict from extract_epoch_boundaries()
+        epoch_boundaries: dict from extract_epoch_boundaries() - {(epoch, pid): (min_ts, max_ts)}
 
     Returns:
         dict: {epoch: duration_seconds}
     """
-    epoch_durations = {}
+    # Group by epoch and find min/max across all ranks
+    epoch_ranges = {}
 
-    for epoch, (min_ts, max_ts) in epoch_boundaries.items():
+    for (epoch, pid), (min_ts, max_ts) in epoch_boundaries.items():
+        if epoch not in epoch_ranges:
+            epoch_ranges[epoch] = (min_ts, max_ts)
+        else:
+            current_min, current_max = epoch_ranges[epoch]
+            epoch_ranges[epoch] = (min(current_min, min_ts), max(current_max, max_ts))
+
+    # Convert to durations
+    epoch_durations = {}
+    for epoch, (min_ts, max_ts) in epoch_ranges.items():
         duration_us = max_ts - min_ts
         epoch_durations[epoch] = duration_us / 1_000_000
 
     return epoch_durations
 
 
-def compute_time_by_category_name(events, epoch_boundaries, category, name):
+def compute_time_by_category_name(events, epoch_boundaries, process_tree, category, name):
     """
     Compute total time for events matching category and name.
 
@@ -173,7 +226,8 @@ def compute_time_by_category_name(events, epoch_boundaries, category, name):
 
     Args:
         events: List of trace events
-        epoch_boundaries: dict from extract_epoch_boundaries()
+        epoch_boundaries: dict from extract_epoch_boundaries() - {(epoch, pid): (min_ts, max_ts)}
+        process_tree: dict from build_process_tree()
         category: Event category to match
         name: Event name to match
 
@@ -189,8 +243,7 @@ def compute_time_by_category_name(events, epoch_boundaries, category, name):
         if event.get('cat') != category or event.get('name') != name:
             continue
 
-        ts = event.get('ts', 0)
-        epoch = get_epoch_for_timestamp(ts, epoch_boundaries)
+        epoch = get_epoch_for_event(event, epoch_boundaries, process_tree)
         if epoch is None:
             continue
 
@@ -200,24 +253,25 @@ def compute_time_by_category_name(events, epoch_boundaries, category, name):
     return dict(epoch_times)
 
 
-def compute_wall_clock_time_by_category_name(events, epoch_boundaries, category, name):
+def compute_wall_clock_time_by_category_name(events, epoch_boundaries, process_tree, category, name):
     """
     Compute wall-clock elapsed time for events matching category and name.
 
-    Measures elapsed time from first event start to last event end per epoch,
-    accounting for overlapping parallel operations.
+    Measures elapsed time from first event start to last event end per (epoch, rank),
+    then sums across ranks per epoch. This prevents cross-epoch bleeding.
 
     Args:
         events: List of trace events
-        epoch_boundaries: dict from extract_epoch_boundaries()
+        epoch_boundaries: dict from extract_epoch_boundaries() - {(epoch, pid): (min_ts, max_ts)}
+        process_tree: dict from build_process_tree()
         category: Event category to match
         name: Event name to match
 
     Returns:
         dict: {epoch: elapsed_seconds}
     """
-    # Track min start and max end for each epoch
-    epoch_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
+    # Track min start and max end for each (epoch, grouping_pid) pair
+    epoch_pid_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
 
     for event in events:
         if event.get('ph') != 'X':  # Only duration events
@@ -226,33 +280,40 @@ def compute_wall_clock_time_by_category_name(events, epoch_boundaries, category,
         if event.get('cat') != category or event.get('name') != name:
             continue
 
-        ts = event.get('ts', 0)
-        epoch = get_epoch_for_timestamp(ts, epoch_boundaries)
+        epoch = get_epoch_for_event(event, epoch_boundaries, process_tree)
         if epoch is None:
             continue
 
+        # Get grouping PID (use parent for workers, own PID for main process)
+        pid = event.get('pid')
+        grouping_pid = process_tree.get(pid, pid)
+
+        ts = event.get('ts', 0)
         dur = event.get('dur', 0)
         te = ts + dur
 
-        epoch_ranges[epoch]['min_ts'] = min(epoch_ranges[epoch]['min_ts'], ts)
-        epoch_ranges[epoch]['max_te'] = max(epoch_ranges[epoch]['max_te'], te)
+        key = (epoch, grouping_pid)
+        epoch_pid_ranges[key]['min_ts'] = min(epoch_pid_ranges[key]['min_ts'], ts)
+        epoch_pid_ranges[key]['max_te'] = max(epoch_pid_ranges[key]['max_te'], te)
 
-    # Convert ranges to durations
-    epoch_times = {}
-    for epoch, range_data in epoch_ranges.items():
+    # Compute per-rank wall-clock time, then sum across ranks per epoch
+    epoch_times = defaultdict(float)
+    for (epoch, grouping_pid), range_data in epoch_pid_ranges.items():
         duration_us = range_data['max_te'] - range_data['min_ts']
-        epoch_times[epoch] = duration_us / 1_000_000  # Convert to seconds
+        duration_s = duration_us / 1_000_000
+        epoch_times[epoch] += duration_s
 
-    return epoch_times
+    return dict(epoch_times)
 
 
-def count_workers_raw(events, epoch_boundaries):
+def count_workers_raw(events, epoch_boundaries, process_tree):
     """
     Count workers from fork/spawn events.
 
     Args:
         events: List of trace events
-        epoch_boundaries: dict from extract_epoch_boundaries()
+        epoch_boundaries: dict from extract_epoch_boundaries() - {(epoch, pid): (min_ts, max_ts)}
+        process_tree: dict from build_process_tree()
 
     Returns:
         dict: {epoch: worker_count}
@@ -270,8 +331,7 @@ def count_workers_raw(events, epoch_boundaries):
         if event_name not in ['fork', 'spawn']:
             continue
 
-        ts = event.get('ts', 0)
-        epoch = get_epoch_for_timestamp(ts, epoch_boundaries)
+        epoch = get_epoch_for_event(event, epoch_boundaries, process_tree)
         if epoch is None:
             continue
 
@@ -281,7 +341,7 @@ def count_workers_raw(events, epoch_boundaries):
     return dict(epoch_workers)
 
 
-def compute_io_metrics_raw(events, epoch_boundaries):
+def compute_io_metrics_raw(events, epoch_boundaries, process_tree):
     """
     Compute I/O size and aggregate bandwidth from POSIX events.
 
@@ -290,7 +350,8 @@ def compute_io_metrics_raw(events, epoch_boundaries):
 
     Args:
         events: List of trace events
-        epoch_boundaries: dict from extract_epoch_boundaries()
+        epoch_boundaries: dict from extract_epoch_boundaries() - {(epoch, pid): (min_ts, max_ts)}
+        process_tree: dict from build_process_tree()
 
     Returns:
         tuple: (epoch_sizes_gb, epoch_bandwidths_mbps)
@@ -314,8 +375,7 @@ def compute_io_metrics_raw(events, epoch_boundaries):
         if event_name not in io_operations:
             continue
 
-        ts = event.get('ts', 0)
-        epoch = get_epoch_for_timestamp(ts, epoch_boundaries)
+        epoch = get_epoch_for_event(event, epoch_boundaries, process_tree)
         if epoch is None:
             continue
 
@@ -349,23 +409,27 @@ def compute_io_metrics_raw(events, epoch_boundaries):
     return epoch_sizes_gb, epoch_bandwidths
 
 
-def compute_effective_io_bandwidth_raw(events, epoch_boundaries):
+def compute_effective_io_bandwidth_raw(events, epoch_boundaries, process_tree):
     """
-    Compute effective I/O bandwidth using wall-clock elapsed time.
+    Compute effective I/O bandwidth using wall-clock elapsed time per rank.
 
     Effective bandwidth = Total I/O Size / Wall-clock elapsed time
     This measures actual throughput and cannot exceed physical LFS bandwidth limits.
     Use this to validate against peak cluster LFS bandwidth.
 
+    Computes per-rank bandwidth then sums across ranks to prevent cross-epoch bleeding.
+
     Args:
         events: List of trace events
-        epoch_boundaries: dict from extract_epoch_boundaries()
+        epoch_boundaries: dict from extract_epoch_boundaries() - {(epoch, pid): (min_ts, max_ts)}
+        process_tree: dict from build_process_tree()
 
     Returns:
         dict: {epoch: effective_bandwidth_mbps}
     """
-    epoch_sizes = defaultdict(float)
-    epoch_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
+    # Track per (epoch, grouping_pid)
+    epoch_pid_sizes = defaultdict(float)
+    epoch_pid_ranges = defaultdict(lambda: {'min_ts': float('inf'), 'max_te': 0})
 
     # I/O operation names to track
     io_operations = {'read', 'write', 'pread', 'pwrite', 'pread64', 'pwrite64',
@@ -383,39 +447,42 @@ def compute_effective_io_bandwidth_raw(events, epoch_boundaries):
         if event_name not in io_operations:
             continue
 
-        ts = event.get('ts', 0)
-        epoch = get_epoch_for_timestamp(ts, epoch_boundaries)
+        epoch = get_epoch_for_event(event, epoch_boundaries, process_tree)
         if epoch is None:
             continue
+
+        # Get grouping PID (use parent for workers, own PID for main process)
+        pid = event.get('pid')
+        grouping_pid = process_tree.get(pid, pid)
 
         args = event.get('args', {})
         # Get size from ret (return value = bytes read/written)
         ret_val = args.get('ret', 0)
+        ts = event.get('ts', 0)
         dur = event.get('dur', 0)
 
         # Only count successful I/O operations (ret > 0)
         if ret_val > 0:
-            epoch_sizes[epoch] += ret_val
+            key = (epoch, grouping_pid)
+            epoch_pid_sizes[key] += ret_val
 
             # Track timestamp range for wall-clock calculation
             te = ts + dur
-            epoch_ranges[epoch]['min_ts'] = min(epoch_ranges[epoch]['min_ts'], ts)
-            epoch_ranges[epoch]['max_te'] = max(epoch_ranges[epoch]['max_te'], te)
+            epoch_pid_ranges[key]['min_ts'] = min(epoch_pid_ranges[key]['min_ts'], ts)
+            epoch_pid_ranges[key]['max_te'] = max(epoch_pid_ranges[key]['max_te'], te)
 
-    # Compute effective bandwidth (MB/s)
-    epoch_bandwidths = {}
-    for epoch in epoch_sizes:
-        if epoch in epoch_ranges:
-            elapsed_us = epoch_ranges[epoch]['max_te'] - epoch_ranges[epoch]['min_ts']
+    # Calculate per-rank bandwidth, then sum across ranks per epoch
+    epoch_bandwidths = defaultdict(float)
+    for (epoch, grouping_pid), size in epoch_pid_sizes.items():
+        key = (epoch, grouping_pid)
+        if key in epoch_pid_ranges:
+            elapsed_us = epoch_pid_ranges[key]['max_te'] - epoch_pid_ranges[key]['min_ts']
             elapsed_sec = elapsed_us / 1_000_000
 
             if elapsed_sec > 0:
-                size_mb = epoch_sizes[epoch] / (1024 * 1024)
-                epoch_bandwidths[epoch] = size_mb / elapsed_sec
-            else:
-                epoch_bandwidths[epoch] = 0.0
-        else:
-            epoch_bandwidths[epoch] = 0.0
+                size_mb = size / (1024 * 1024)
+                bandwidth = size_mb / elapsed_sec
+                epoch_bandwidths[epoch] += bandwidth
 
     return dict(epoch_bandwidths)
 
@@ -426,10 +493,17 @@ def compute_metrics_raw(events):
 
     print("\n=== Computing Raw Metrics ===")
 
-    # Extract epoch boundaries first
-    print("  - Extracting epoch boundaries...")
+    # Build process tree first
+    print("  - Building process tree...")
+    process_tree = build_process_tree(events)
+    print(f"    Found {len(process_tree)} child processes")
+
+    # Extract epoch boundaries per rank
+    print("  - Extracting per-rank epoch boundaries...")
     epoch_boundaries = extract_epoch_boundaries(events)
-    print(f"    Found {len(epoch_boundaries)} epoch(s): {sorted(epoch_boundaries.keys())}")
+    # Count unique epochs
+    unique_epochs = {epoch for epoch, _ in epoch_boundaries.keys()}
+    print(f"    Found {len(unique_epochs)} epoch(s): {sorted(unique_epochs)}")
 
     # Trace duration
     print("  - Trace duration...")
@@ -441,46 +515,46 @@ def compute_metrics_raw(events):
 
     # Compute time (fetch.block) - total work
     print("  - Compute time (fetch.block)...")
-    metrics['compute_time'] = compute_time_by_category_name(events, epoch_boundaries, 'dataloader', 'fetch.block')
+    metrics['compute_time'] = compute_time_by_category_name(events, epoch_boundaries, process_tree, 'dataloader', 'fetch.block')
 
     # Compute time - wall-clock elapsed
     print("  - Compute time wall-clock (fetch.block)...")
-    metrics['compute_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, 'dataloader', 'fetch.block')
+    metrics['compute_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, process_tree, 'dataloader', 'fetch.block')
 
     # Fetch iter time - total work
     print("  - Fetch iter time...")
-    metrics['fetch_iter_time'] = compute_time_by_category_name(events, epoch_boundaries, 'dataloader', 'fetch.iter')
+    metrics['fetch_iter_time'] = compute_time_by_category_name(events, epoch_boundaries, process_tree, 'dataloader', 'fetch.iter')
 
     # Fetch iter time - wall-clock elapsed
     print("  - Fetch iter time wall-clock...")
-    metrics['fetch_iter_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, 'dataloader', 'fetch.iter')
+    metrics['fetch_iter_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, process_tree, 'dataloader', 'fetch.iter')
 
     # Num workers
     print("  - Num workers...")
-    metrics['num_workers'] = count_workers_raw(events, epoch_boundaries)
+    metrics['num_workers'] = count_workers_raw(events, epoch_boundaries, process_tree)
 
     # Preprocess time - total work
     print("  - Preprocess time...")
-    metrics['preprocess_time'] = compute_time_by_category_name(events, epoch_boundaries, 'data', 'preprocess')
+    metrics['preprocess_time'] = compute_time_by_category_name(events, epoch_boundaries, process_tree, 'data', 'preprocess')
 
     # Preprocess time - wall-clock elapsed
     print("  - Preprocess time wall-clock...")
-    metrics['preprocess_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, 'data', 'preprocess')
+    metrics['preprocess_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, process_tree, 'data', 'preprocess')
 
     # Get item time - total work
     print("  - Get item time...")
-    metrics['getitem_time'] = compute_time_by_category_name(events, epoch_boundaries, 'data', 'item')
+    metrics['getitem_time'] = compute_time_by_category_name(events, epoch_boundaries, process_tree, 'data', 'item')
 
     # Get item time - wall-clock elapsed
     print("  - Get item time wall-clock...")
-    metrics['getitem_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, 'data', 'item')
+    metrics['getitem_time_wall_clock'] = compute_wall_clock_time_by_category_name(events, epoch_boundaries, process_tree, 'data', 'item')
 
     # I/O metrics
     print("  - I/O size and aggregate bandwidth...")
-    metrics['io_size_gb'], metrics['posix_bandwidth'] = compute_io_metrics_raw(events, epoch_boundaries)
+    metrics['io_size_gb'], metrics['posix_bandwidth'] = compute_io_metrics_raw(events, epoch_boundaries, process_tree)
 
     print("  - Effective I/O bandwidth...")
-    metrics['effective_bandwidth'] = compute_effective_io_bandwidth_raw(events, epoch_boundaries)
+    metrics['effective_bandwidth'] = compute_effective_io_bandwidth_raw(events, epoch_boundaries, process_tree)
 
     return metrics
 

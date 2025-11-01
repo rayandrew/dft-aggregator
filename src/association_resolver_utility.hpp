@@ -111,27 +111,38 @@ class AssociationResolverUtility
         for (auto& [key, metrics] : output.aggregations.aggregations) {
             bool updated = false;
 
-            // Resolve boundary associations (epoch, step, etc.)
-            if (!input.config.boundary_events.empty() &&
-                global_tracker.has_boundary_events()) {
-                // Use the first timestamp in the metrics as representative
-                // (all events with this key should be in the same boundary)
-                std::uint64_t representative_ts = metrics.first_ts;
-
-                auto associations = global_tracker.get_boundary_associations(
-                    key.pid, representative_ts);
-                if (!associations.empty()) {
-                    metrics.boundary_associations = associations;
-                    updated = true;
-                }
-            }
-
-            // Resolve parent PID
+            // First resolve parent PID
             if (input.config.track_process_parents &&
                 global_tracker.has_process_tree()) {
                 std::uint64_t parent = global_tracker.get_parent_pid(key.pid);
                 if (parent != 0) {
                     metrics.parent_pid = parent;
+                    updated = true;
+                }
+            }
+
+            // Resolve boundary associations (epoch, step, etc.)
+            // For worker events (with parent_pid), use parent's epoch
+            // boundaries For main process events, use their own epoch
+            // boundaries
+            if (!input.config.boundary_events.empty() &&
+                global_tracker.has_boundary_events()) {
+                // Use the midpoint timestamp for more accurate boundary
+                // assignment This reduces misclassification when buckets span
+                // boundaries
+                std::uint64_t representative_ts = (metrics.ts + metrics.te) / 2;
+
+                // Determine which PID's boundaries to use:
+                // - For worker events (has parent_pid), use parent's boundaries
+                // - For main process events (no parent), use their own
+                // boundaries
+                std::uint64_t boundary_pid =
+                    (metrics.parent_pid > 0) ? metrics.parent_pid : key.pid;
+
+                auto associations = global_tracker.get_boundary_associations(
+                    boundary_pid, representative_ts);
+                if (!associations.empty()) {
+                    metrics.boundary_associations = associations;
                     updated = true;
                 }
             }
