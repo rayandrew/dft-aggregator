@@ -79,7 +79,58 @@ class PerfettoCounterWriter {
 
         buffer += "[\n";
 
-        // Emit metadata events for root processes first
+        // Emit trace metadata event with trace duration and boundary durations
+        if (resolver_output.trace_duration > 0 ||
+            !resolver_output.boundary_durations.empty()) {
+            buffer +=
+                "{\"name\":\"trace_metadata\",\"cat\":\"metadata\",\"ph\":"
+                "\"M\",\"args\":{";
+
+            // Add trace duration
+            char temp[512];
+            std::snprintf(temp, sizeof(temp), "\"trace_duration\":%llu",
+                          resolver_output.trace_duration);
+            buffer += temp;
+
+            // Add boundary durations as nested object
+            if (!resolver_output.boundary_durations.empty()) {
+                buffer += ",\"boundary_durations\":{";
+                bool first_boundary = true;
+
+                for (const auto& [boundary_name, value_map] :
+                     resolver_output.boundary_durations) {
+                    if (!first_boundary) {
+                        buffer += ",";
+                    }
+                    first_boundary = false;
+
+                    buffer += "\"";
+                    append_json_string(buffer, boundary_name);
+                    buffer += "\":{";
+
+                    bool first_value = true;
+                    for (const auto& [value, duration] : value_map) {
+                        if (!first_value) {
+                            buffer += ",";
+                        }
+                        first_value = false;
+
+                        buffer += "\"";
+                        append_json_string(buffer, value);
+                        buffer += "\":";
+                        buffer += std::to_string(duration);
+                    }
+
+                    buffer += "}";
+                }
+
+                buffer += "}";
+            }
+
+            buffer += "}},\n";
+        }
+
+        // Emit metadata events for root processes
         if (!root_pids.empty()) {
             for (std::uint64_t pid : root_pids) {
                 buffer +=

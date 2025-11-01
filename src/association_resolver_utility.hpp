@@ -27,11 +27,15 @@ struct AssociationResolverInput {
 /**
  * @brief Output from association resolution.
  *
- * Returns the same aggregations but with globally-resolved associations.
+ * Returns the same aggregations but with globally-resolved associations,
+ * plus trace-level metadata (durations, boundary durations).
  */
 struct AssociationResolverOutput {
     EventAggregatorUtilityOutput aggregations;
     std::unordered_set<std::uint64_t> root_pids;
+    std::uint64_t trace_duration = 0;  // Total trace duration (microseconds)
+    BoundaryDurationsMap boundary_durations;  // boundary_name -> (value ->
+                                              // duration in microseconds)
     bool success = true;
 };
 
@@ -141,8 +145,87 @@ class AssociationResolverUtility
             "Association resolution complete: %zu/%zu metrics updated",
             metrics_updated, output.aggregations.aggregations.size());
 
+        // Step 3: Compute trace duration and boundary durations
+        compute_trace_metadata(global_tracker, output.aggregations, output);
+
         output.root_pids = root_pids;
         output.success = true;
         return output;
+    }
+
+   private:
+    /**
+     * @brief Computes trace-level metadata including trace duration and
+     * boundary durations.
+     *
+     * @param tracker Global tracker with all boundary intervals
+     * @param aggregations Aggregated metrics (unused currently, for future
+     * extensions)
+     * @param output Output structure to populate with metadata
+     */
+    void compute_trace_metadata(
+        const AssociationTracker& tracker,
+        const EventAggregatorUtilityOutput& aggregations,
+        AssociationResolverOutput& output) {
+        // Get all boundary intervals
+        const auto& intervals = tracker.get_all_intervals();
+
+        if (intervals.empty()) {
+            DFTRACER_UTILS_LOG_INFO(
+                "No boundary intervals found, skipping metadata computation");
+            return;
+        }
+
+        // Track ranges for each boundary name+value combination
+        // Map: boundary_name -> (boundary_value -> (min_ts, max_ts))
+        std::unordered_map<
+            std::string,
+            std::unordered_map<std::string,
+                               std::pair<std::uint64_t, std::uint64_t>>>
+            ranges;
+
+        std::uint64_t global_min = UINT64_MAX;
+        std::uint64_t global_max = 0;
+
+        for (const auto& interval : intervals) {
+            // Update global trace duration
+            global_min = std::min(global_min, interval.start_ts);
+            global_max = std::max(global_max, interval.end_ts);
+
+            // Update boundary-specific ranges
+            auto& value_map = ranges[interval.name];
+            auto& range = value_map[interval.value];
+
+            if (range.first == 0 && range.second == 0) {
+                // Initialize range
+                range.first = interval.start_ts;
+                range.second = interval.end_ts;
+            } else {
+                // Extend range
+                range.first = std::min(range.first, interval.start_ts);
+                range.second = std::max(range.second, interval.end_ts);
+            }
+        }
+
+        // Set trace duration
+        if (global_max > global_min) {
+            output.trace_duration = global_max - global_min;
+        }
+
+        // Convert ranges to durations
+        std::size_t total_boundaries = 0;
+        for (const auto& [name, value_map] : ranges) {
+            for (const auto& [value, range] : value_map) {
+                output.boundary_durations[name][value] =
+                    range.second - range.first;
+                total_boundaries++;
+            }
+        }
+
+        DFTRACER_UTILS_LOG_INFO(
+            "Computed trace metadata: trace_duration=%lu us, %zu boundary "
+            "types, %zu total boundaries",
+            output.trace_duration, output.boundary_durations.size(),
+            total_boundaries);
     }
 };

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -10,6 +12,11 @@
 
 // Forward declaration
 class AssociationTracker;
+
+// Type aliases for boundary duration tracking
+using BoundaryDurationMap = std::unordered_map<std::string, std::uint64_t>;
+using BoundaryDurationsMap =
+    std::unordered_map<std::string, BoundaryDurationMap>;
 
 /**
  * @brief Output from processing a single chunk (byte range) of a file.
